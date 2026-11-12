@@ -225,6 +225,18 @@ try {
     $colours = Get-ColourCount -Path $shot
     Check 'startup: terminal draws text' ($colours -gt 8) "colours=$colours"
 
+    # The shell's title reaches the window title.
+    [GhosttySmoke]::Type($pane, 'title SMOKETITLE')
+    [GhosttySmoke]::Key($pane, 0x0D)
+    $title = ''
+    $deadline = [DateTime]::UtcNow.AddSeconds(6)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $title = [GhosttySmoke]::WindowTitle($frame)
+        if ($title -match 'smoketitle') { break }
+        Start-Sleep -Milliseconds 200
+    }
+    Check 'title: window title follows the shell' ($title -match 'smoketitle') "title=$title"
+
     # A split must produce two panes that do not overlap.
     [GhosttySmoke]::Key($pane, $VK.F9)
     $panes = Wait-Until {
@@ -320,20 +332,6 @@ try {
     $afterHash = (Get-FileHash $after -Algorithm SHA256).Hash
     Check 'paste: screen changes' ($beforeHash -ne $afterHash)
 
-    # The shell's title reaches the window title.
-    [GhosttySmoke]::Type($paneAfterTab, 'title SMOKE_TITLE')
-    [GhosttySmoke]::Key($paneAfterTab, 0x0D)
-    $title = ''
-    $deadline = [DateTime]::UtcNow.AddSeconds(6)
-    while ([DateTime]::UtcNow -lt $deadline) {
-        $title = [GhosttySmoke]::WindowTitle($frame)
-        if ($title -match 'smoke_title') { break }
-        Start-Sleep -Milliseconds 200
-    }
-    # Before the fix the window title stayed on the hardcoded default, so a
-    # title derived from the surface is what this asserts. The shell's own
-    # title command is typed above but is not required yet.
-    Check 'title: window title follows the surface' ($title.Length -gt 0 -and $title -ne 'Ghostty') "title=$title"
 
 }
 finally {
