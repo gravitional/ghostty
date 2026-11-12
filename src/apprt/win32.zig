@@ -1174,6 +1174,17 @@ pub const Frame = struct {
         self.layout();
     }
 
+    /// Ask the visible panes to paint. The core never tells the apprt that
+    /// a new frame is ready on this platform, so the presentation is pumped
+    /// from the window timer: a paint takes whatever frame the renderer has
+    /// produced and blits it.
+    fn invalidatePanes(self: *Frame) void {
+        if (self.active >= self.tabs.items.len) return;
+        for (self.tabs.items[self.active].panes.items) |pane| {
+            _ = InvalidateRect(pane.hwnd, null, 0);
+        }
+    }
+
     fn layout(self: *Frame) void {
         var client: RECT = undefined;
         if (GetClientRect(self.hwnd, &client) == 0) return;
@@ -2152,6 +2163,12 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
                 app.core_app.tick(app) catch |err| {
                     log.err("core tick failed err={}", .{err});
                 };
+                for (app.frames.items) |f| {
+                    if (f.hwnd == hwnd) {
+                        f.invalidatePanes();
+                        break;
+                    }
+                }
             }
             return 0;
         },
