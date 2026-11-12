@@ -70,6 +70,17 @@ pub fn init(
         return err;
     };
 
+    // Direct3D sharing would let the Win32 runtime present the render
+    // target without a CPU round trip. It is a WGL extension (not a GL
+    // one), and only NVIDIA drivers ship it, so callers must treat it as
+    // optional.
+    if (display.queryString(.extensions)) |exts| {
+        log.info("DX interop support={} interop2={}", .{
+            wsi.hasExtension(exts, "WGL_NV_DX_interop"),
+            wsi.hasExtension(exts, "WGL_NV_DX_interop2"),
+        });
+    }
+
     // Release current so that the main thread
     // doesn't hold onto the GL context forever.
     defer display.releaseCurrent();
