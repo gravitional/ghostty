@@ -4905,6 +4905,11 @@ pub fn finalize(self: *Config) !void {
                     .true,
             }
         },
+
+        // The native Win32 runtime owns its own single-instance behaviour
+        // through the Windows event loop, so there is nothing to default
+        // here yet.
+        .win32 => {},
     }
 
     // Default our click interval
