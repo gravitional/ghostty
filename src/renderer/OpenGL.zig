@@ -289,11 +289,8 @@ pub const present = if (builtin.target.os.tag == .windows) presentMemory else pr
 
 /// Present by blitting into the window's default framebuffer and swapping.
 ///
-/// This is how WGL applications present: the default framebuffer *is* the
-/// window back buffer, so the GPU never hands the frame to the CPU.
-/// Whether to hand finished frames to the window with WGL (blit to the
-/// default framebuffer plus SwapBuffers) instead of copying them back to the
-/// CPU for the apprt to blit.
+/// Whether to hand finished frames to the window with WGL instead of copying
+/// them back to the CPU for the apprt to blit.
 ///
 /// Disabled on Windows: presenting this way into our windows yields blank
 /// frames. The blit itself is issued (the frame buffer is bound, the sizes
@@ -303,6 +300,10 @@ pub const present = if (builtin.target.os.tag == .windows) presentMemory else pr
 /// correct image, so it stays the default until the WGL path is understood.
 const present_with_wgl = false;
 
+/// Present directly to the window.
+///
+/// This is how WGL applications present: the default framebuffer *is* the
+/// window back buffer, so the GPU never hands the frame to the CPU.
 fn presentWindow(self: *OpenGL, target: Target) bool {
     if (comptime builtin.target.os.tag != .windows) return false;
     if (comptime !present_with_wgl) return false;
