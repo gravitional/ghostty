@@ -298,6 +298,9 @@ pub const App = struct {
     /// The first window created. Used for process-wide messages.
     main_hwnd: ?HWND = null,
 
+    /// Every open window.
+    surfaces: std.ArrayListUnmanaged(*Surface) = .empty,
+
     pub const Options = struct {};
 
     /// There is no cross-process IPC channel on Windows yet, so CLI
@@ -348,25 +351,7 @@ pub const App = struct {
         _ = SetProcessDpiAwarenessContext(dpi_aware_v2);
 
         // Create the initial window before entering the loop.
-        const alloc = self.core_app.alloc;
-        const surface = try alloc.create(Surface);
-        errdefer alloc.destroy(surface);
-        try surface.init(self, .{});
-        self.main_hwnd = surface.hwnd;
-        // The first ShowWindow call in a process uses STARTUPINFO's show
-        // state (often SW_HIDE for console-launched processes), so show
-        // again to make sure the window is really visible.
-        _ = ShowWindow(surface.hwnd, SW_SHOW);
-        _ = ShowWindow(surface.hwnd, SW_SHOW);
-        _ = UpdateWindow(surface.hwnd);
-
-        // Claim focus: the process that launched us (a console, Explorer)
-        // is usually the foreground window, and Windows allows that
-        // process to hand focus to the window it just started.
-        _ = SetForegroundWindow(surface.hwnd);
-        _ = SetFocus(surface.hwnd);
-
-        _ = SetTimer(surface.hwnd, 1, tick_interval_ms, null);
+        _ = try self.createSurface();
 
         var msg: MSG = .{};
         while (true) {
@@ -381,9 +366,77 @@ pub const App = struct {
             _ = DispatchMessageW(&msg);
         }
 
-        // The core tears its own surface down when the shell exits (it
-        // stops the render and IO threads before we get here), so we only
-        // release the memory this runtime allocated.
+        // Windows that were not closed through the normal path (a `.quit`
+        // action, for example) still own runtime memory. Destroying them
+        // runs WM_DESTROY synchronously, which frees each surface.
+        while (self.surfaces.items.len > 0) {
+            const surface = self.surfaces.items[self.surfaces.items.len - 1];
+            _ = DestroyWindow(surface.hwnd);
+        }
+    }
+
+    /// Create, show and focus a new window.
+    fn createSurface(self: *App) !*Surface {
+        const alloc = self.core_app.alloc;
+
+        const surface = try alloc.create(Surface);
+        errdefer alloc.destroy(surface);
+        try surface.init(self, .{});
+        errdefer alloc.destroy(surface);
+
+        try self.surfaces.append(alloc, surface);
+
+        // The first ShowWindow call in a process uses STARTUPINFO's show
+        // state (often SW_HIDE for console-launched processes), so show
+        // again to make sure the window is really visible.
+        _ = ShowWindow(surface.hwnd, SW_SHOW);
+        _ = ShowWindow(surface.hwnd, SW_SHOW);
+        _ = UpdateWindow(surface.hwnd);
+
+        // Claim focus: the process that launched us (a console, Explorer)
+        // is usually the foreground window, and Windows allows that
+        // process to hand focus to the window it just started.
+        _ = SetForegroundWindow(surface.hwnd);
+        _ = SetFocus(surface.hwnd);
+
+        // One timer drives the core tick for the whole process, so it is
+        // owned by the main window.
+        if (self.main_hwnd == null) {
+            self.main_hwnd = surface.hwnd;
+            _ = SetTimer(surface.hwnd, 1, tick_interval_ms, null);
+        }
+
+        return surface;
+    }
+
+    /// Release a window after it has been destroyed.
+    fn destroySurface(self: *App, surface: *Surface) void {
+        const alloc = self.core_app.alloc;
+
+        if (self.main_hwnd == surface.hwnd) {
+            _ = KillTimer(surface.hwnd, 1);
+            self.main_hwnd = null;
+        }
+
+        for (self.surfaces.items, 0..) |item, i| {
+            if (item == surface) {
+                _ = self.surfaces.swapRemove(i);
+                break;
+            }
+        }
+
+        // Keep a window around to receive process-wide messages, and quit
+        // once the last one is gone.
+        if (self.main_hwnd == null) {
+            if (self.surfaces.items.len > 0) {
+                const next = self.surfaces.items[0];
+                self.main_hwnd = next.hwnd;
+                _ = SetTimer(next.hwnd, 1, tick_interval_ms, null);
+            } else {
+                PostQuitMessage(0);
+            }
+        }
+
         if (surface.pixels.len > 0) alloc.free(surface.pixels);
         if (surface.title) |title| alloc.free(title);
         alloc.destroy(surface);
@@ -407,11 +460,14 @@ pub const App = struct {
         comptime action: apprt.Action.Key,
         value: apprt.Action.Value(action),
     ) !bool {
-        _ = self;
-
         switch (action) {
             .quit => {
                 _ = PostQuitMessage(0);
+                return true;
+            },
+
+            .new_window => {
+                _ = try self.createSurface();
                 return true;
             },
 
@@ -1090,13 +1146,7 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
         },
 
         WM_DESTROY => {
-            if (app_instance) |app| {
-                if (app.main_hwnd == hwnd) {
-                    _ = KillTimer(hwnd, 1);
-                    app.main_hwnd = null;
-                    PostQuitMessage(0);
-                }
-            }
+            if (app_instance) |app| app.destroySurface(self);
             return 0;
         },
 

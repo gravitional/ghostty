@@ -26,6 +26,7 @@ const simd = @import("simd/main.zig");
 const crash = @import("crash/main.zig");
 const unicode = @import("unicode/main.zig");
 const rendererpkg = @import("renderer.zig");
+const build_config = @import("build_config.zig");
 const termio = @import("termio.zig");
 const font = @import("font/main.zig");
 const Command = @import("Command.zig");
@@ -97,6 +98,10 @@ renderer_state: rendererpkg.State,
 
 /// The renderer thread manager
 renderer_thread: rendererpkg.Thread,
+
+/// Renderer device owned by this surface, when the app runtime gives each
+/// surface its own device instead of sharing one process-wide.
+render_device: ?*rendererpkg.Device = null,
 
 /// The actual thread
 renderer_thr: std.Thread,
@@ -561,8 +566,17 @@ pub fn init(
         break :size size;
     };
 
-    // Initialize the render device if it hasn't been initialized already
-    const render_device = app.device orelse device: {
+    // Initialize the render device.
+    //
+    // The Win32 runtime binds a render device to one window: its GL context
+    // is current on that window's device context and it presents with
+    // SwapBuffers. Such a device cannot be shared by two windows, so each
+    // surface owns its own. Other app runtimes share one process-wide
+    // device.
+    const render_device: *rendererpkg.Device = if (comptime build_config.app_runtime == .win32) device: {
+        const device_options = try rt_surface.renderDeviceOptions();
+        break :device try .init(alloc, device_options);
+    } else app.device orelse device: {
         const device_options = try rt_surface.renderDeviceOptions();
         const device: *rendererpkg.Device = try .init(alloc, device_options);
         app.device = device;
@@ -609,6 +623,7 @@ pub fn init(
     errdefer io_thread.deinit();
 
     self.* = .{
+        .render_device = if (comptime build_config.app_runtime == .win32) render_device else null,
         .id = id: {
             while (true) {
                 const candidate = candidate: {
@@ -852,6 +867,10 @@ pub fn deinit(self: *Surface) void {
     // thread's `draw_now` handle, and the renderer's deinit is what
     // stops the display link for good.
     self.renderer.deinit();
+    if (self.render_device) |dev| {
+        dev.deinit(self.alloc);
+        self.render_device = null;
+    }
     self.renderer_thread.deinit();
     self.io_thread.deinit();
     self.mouse.selection_gesture.deinit(&self.io.terminal);
