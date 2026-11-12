@@ -443,7 +443,7 @@ pub const App = struct {
         _: Allocator,
         _: apprt.ipc.Target,
         comptime action: apprt.ipc.Action.Key,
-        _: apprt.ipc.Action.Value(action),
+        value: apprt.ipc.Action.Value(action),
     ) !bool {
         // Only actions this runtime can carry out are forwarded. Returning
         // false lets the CLI report that the action is unsupported rather
@@ -466,12 +466,28 @@ pub const App = struct {
         if (file == INVALID_HANDLE_VALUE) return false;
         defer _ = CloseHandle(file);
 
-        var buf: [8]u8 = undefined;
+        // Only the working directory is forwarded; other arguments are
+        // still ignored.
+        var directory: ?[]const u8 = null;
+        if (value.arguments) |arguments| {
+            for (arguments) |argument| {
+                if (std.mem.startsWith(u8, argument, "--working-directory=")) {
+                    directory = argument["--working-directory=".len..];
+                    break;
+                }
+            }
+        }
+
+        const payload_len: usize = if (directory) |dir| dir.len else 0;
+        const buf = std.heap.page_allocator.alloc(u8, 8 + payload_len) catch return false;
+        defer std.heap.page_allocator.free(buf);
+
         std.mem.writeInt(u32, buf[0..4], @backingInt(tag), .little);
-        std.mem.writeInt(u32, buf[4..8], 0, .little);
+        std.mem.writeInt(u32, buf[4..8], @intCast(payload_len), .little);
+        if (directory) |dir| @memcpy(buf[8..], dir);
 
         var written: DWORD = 0;
-        if (WriteFile(file, &buf, buf.len, &written, null) == 0) return false;
+        if (WriteFile(file, buf.ptr, @intCast(buf.len), &written, null) == 0) return false;
         return written == buf.len;
     }
 
@@ -511,7 +527,7 @@ pub const App = struct {
         _ = SetProcessDpiAwarenessContext(dpi_aware_v2);
 
         // Create the initial window before entering the loop.
-        _ = try self.createFrame();
+        _ = try self.createFrame(null);
 
         // Accept commands from other processes (`ghostty +new-window`).
         // The thread lives for the process lifetime; it blocks on
@@ -545,7 +561,7 @@ pub const App = struct {
     }
 
     /// Create, show and focus a new window with one tab.
-    fn createFrame(self: *App) !*Frame {
+    fn createFrame(self: *App, working_directory: ?[]const u8) !*Frame {
         const frame = try Frame.create(self);
         errdefer self.destroyFrame(frame);
 
@@ -555,7 +571,7 @@ pub const App = struct {
         _ = ShowWindow(frame.hwnd, SW_SHOW);
         _ = UpdateWindow(frame.hwnd);
 
-        try self.addTab(frame);
+        try self.addTab(frame, working_directory);
 
         _ = SetForegroundWindow(frame.hwnd);
         _ = SetFocus(frame.hwnd);
@@ -571,13 +587,13 @@ pub const App = struct {
     }
 
     /// Add a tab (with one pane) to `frame` and focus it.
-    fn addTab(self: *App, frame: *Frame) !void {
+    fn addTab(self: *App, frame: *Frame, working_directory: ?[]const u8) !void {
         try frame.addTab();
-        _ = try self.createPane(frame, frame.tabs.items.len - 1);
+        _ = try self.createPane(frame, frame.tabs.items.len - 1, working_directory);
     }
 
     /// Add a pane to an existing tab.
-    fn createPane(self: *App, frame: *Frame, tab_index: usize) !*Surface {
+    fn createPane(self: *App, frame: *Frame, tab_index: usize, working_directory: ?[]const u8) !*Surface {
         const alloc = self.core_app.alloc;
 
         const surface = try alloc.create(Surface);
@@ -586,6 +602,7 @@ pub const App = struct {
         try surface.init(self, .{
             .owner = frame.hwnd,
             .rect = frame.contentRect(),
+            .working_directory = working_directory,
         });
         errdefer alloc.destroy(surface);
 
@@ -632,6 +649,7 @@ pub const App = struct {
 
         if (surface.frame) |frame| frame.removeSurface(surface);
 
+        if (surface.working_directory) |dir| alloc.free(dir);
         if (surface.pixels.len > 0) alloc.free(surface.pixels);
         if (surface.title) |title| alloc.free(title);
         alloc.destroy(surface);
@@ -682,21 +700,28 @@ pub const App = struct {
     }
 
     /// Apply a command received over IPC.
-    fn handleIpc(self: *App, tag_raw: u32) void {
+    fn handleIpc(self: *App, tag_raw: u32, dir_ptr: usize) void {
+        // The string was allocated by the IPC thread; free it here.
+        const dir_z: ?[*:0]u8 = if (dir_ptr != 0) @ptrFromInt(dir_ptr) else null;
+        const directory: ?[]const u8 = if (dir_z) |ptr| std.mem.span(ptr) else null;
+        defer if (dir_z) |ptr| {
+            std.heap.page_allocator.free(ptr[0..std.mem.span(ptr).len :0]);
+        };
+
         const tag: IpcTag = switch (tag_raw) {
             1 => .new_window,
             2 => .new_tab,
             else => return,
         };
         switch (tag) {
-            .new_window => _ = self.createFrame() catch |err| {
+            .new_window => _ = self.createFrame(directory) catch |err| {
                 log.err("failed to open window for IPC err={}", .{err});
             },
 
             .new_tab => {
                 if (self.frames.items.len > 0) {
                     const frame = self.frames.items[self.frames.items.len - 1];
-                    self.addTab(frame) catch |err| {
+                    self.addTab(frame, directory) catch |err| {
                         log.err("failed to open tab for IPC err={}", .{err});
                     };
                 }
@@ -729,7 +754,7 @@ pub const App = struct {
             },
 
             .new_window => {
-                _ = try self.createFrame();
+                _ = try self.createFrame(null);
                 return true;
             },
 
@@ -741,7 +766,7 @@ pub const App = struct {
                     else
                         null,
                 };
-                if (frame) |f| try self.addTab(f);
+                if (frame) |f| try self.addTab(f, null);
                 return frame != null;
             },
 
@@ -753,7 +778,7 @@ pub const App = struct {
                 const frame = if (surface) |surf| surf.frame else null;
                 if (frame) |f| {
                     const index = f.tabIndex(surface.?) orelse f.active;
-                    _ = try self.createPane(f, index);
+                    _ = try self.createPane(f, index, null);
                     return true;
                 }
                 return false;
@@ -1165,7 +1190,7 @@ fn frameProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c)
         },
 
         WM_APP_IPC => {
-            if (app_instance) |app| app.handleIpc(@intCast(wParam));
+            if (app_instance) |app| app.handleIpc(@intCast(wParam), @intCast(lParam));
             return 0;
         },
 
@@ -1350,6 +1375,10 @@ pub const Surface = struct {
     /// True while an IME composition string is active.
     composing: bool = false,
 
+    /// Working directory requested for this surface. We own it because the
+    /// core keeps a reference to it for the lifetime of the surface.
+    working_directory: ?[:0]u8 = null,
+
     /// Scratch buffer for the BGRA, top-down copy we hand to GDI.
     pixels: []u8 = &.{},
 
@@ -1476,6 +1505,13 @@ pub const Surface = struct {
 
         var config = try apprt.surface.newConfig(app.core_app, &app.config, .window);
         defer config.deinit();
+
+        if (opts.working_directory) |dir| {
+            if (self.app.core_app.alloc.dupeSentinel(u8, dir, 0)) |owned| {
+                self.working_directory = owned;
+                config.@"working-directory" = .{ .path = owned };
+            } else |_| {}
+        }
 
         try self.core_surface.init(
             app.core_app.alloc,
@@ -2000,7 +2036,7 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
         },
 
         WM_APP_IPC => {
-            if (app_instance) |app| app.handleIpc(@intCast(wParam));
+            if (app_instance) |app| app.handleIpc(@intCast(wParam), @intCast(lParam));
             return 0;
         },
 
@@ -2234,8 +2270,17 @@ fn ipcServerMain(app: *App) void {
             var read: DWORD = 0;
             if (ReadFile(pipe, &buf, buf.len, &read, null) != 0 and read >= 8) {
                 const tag = std.mem.readInt(u32, buf[0..4], .little);
+                const len = std.mem.readInt(u32, buf[4..8], .little);
+
+                // The UI thread takes ownership of this string.
+                const dir: usize = if (len > 0 and len <= buf.len - 8) blk: {
+                    const copy = std.heap.page_allocator.allocSentinel(u8, len, 0) catch break :blk 0;
+                    @memcpy(copy[0..len], buf[8 .. 8 + len]);
+                    break :blk @intFromPtr(copy.ptr);
+                } else 0;
+
                 if (app.main_hwnd) |hwnd| {
-                    _ = PostMessageW(hwnd, WM_APP_IPC, @intCast(tag), 0);
+                    _ = PostMessageW(hwnd, WM_APP_IPC, @intCast(tag), @intCast(dir));
                 }
             }
         }
