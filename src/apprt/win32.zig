@@ -604,6 +604,18 @@ pub const App = struct {
 
         frame.selectTab(tab_index);
         frame.layoutTab(tab_index);
+
+        // The first frames are presented before the popup is on screen and
+        // the window only shows them once its drawable has been resized, so
+        // nudge the size and ask for another frame.
+        _ = ShowWindow(surface.hwnd, SW_SHOW);
+        const rect = frame.contentRect();
+        const width = @max(1, rect.right - rect.left);
+        const height = @max(1, rect.bottom - rect.top);
+        _ = MoveWindow(surface.hwnd, rect.left, rect.top, width - 1, height - 1, 1);
+        _ = MoveWindow(surface.hwnd, rect.left, rect.top, width, height, 1);
+        surface.core_surface.refreshCallback() catch {};
+
         return surface;
     }
 
@@ -991,6 +1003,7 @@ pub const Frame = struct {
             const active = tab.panes.items[tab.active];
             _ = SetWindowPos(active.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             _ = SetFocus(active.hwnd);
+            active.core_surface.refreshCallback() catch {};
         }
 
         _ = InvalidateRect(self.tab_bar, null, 1);
