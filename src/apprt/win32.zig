@@ -594,6 +594,13 @@ pub const App = struct {
         try frame.tabs.items[tab_index].panes.append(alloc, surface);
         surface.frame = frame;
 
+        // The core reports its initial title while the surface is still
+        // initializing, before it knows which window it belongs to, so the
+        // label is applied here instead.
+        if (surface.title) |title| {
+            frame.setTitle(surface, std.mem.sliceTo(title, 0));
+        }
+
         frame.selectTab(tab_index);
         frame.layoutTab(tab_index);
         return surface;
@@ -741,6 +748,26 @@ pub const App = struct {
             .set_title => {
                 if (target == .surface) {
                     target.surface.rt_surface.setTitle(value.title);
+                }
+                return true;
+            },
+
+            .set_tab_title => {
+                // Only the tab label changes; the window title stays.
+                if (target == .surface) {
+                    const surface = target.surface.rt_surface;
+                    if (surface.frame) |frame| frame.setTitle(surface, value.title);
+                }
+                return true;
+            },
+
+            .set_window_title => {
+                const surface: ?*Surface = switch (target) {
+                    .surface => |s| s.rt_surface,
+                    else => null,
+                };
+                if (surface) |surf| {
+                    if (surf.frame) |frame| frame.setWindowTitle(value.title);
                 }
                 return true;
             },
@@ -1014,6 +1041,14 @@ pub const Frame = struct {
         self.titles.items[index] = copy;
 
         _ = InvalidateRect(self.tab_bar, null, 1);
+    }
+
+    /// Set the host window title.
+    fn setWindowTitle(self: *Frame, title: []const u8) void {
+        const alloc = self.app.core_app.alloc;
+        const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, title) catch return;
+        defer alloc.free(wide);
+        _ = SetWindowTextW(self.hwnd, wide.ptr);
     }
 
     /// Close every pane of a tab.
