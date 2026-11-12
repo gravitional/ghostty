@@ -640,6 +640,9 @@ pub const App = struct {
 
         try frame.tabs.items[tab_index].panes.append(alloc, surface);
         try frame.tabs.items[tab_index].dirs.append(alloc, direction);
+
+        // The new pane is the one the user asked for, so focus it.
+        frame.tabs.items[tab_index].active = frame.tabs.items[tab_index].panes.items.len - 1;
         surface.frame = frame;
 
         // The core reports its initial title while the surface is still
@@ -1288,12 +1291,56 @@ pub const Frame = struct {
         const count = tab.panes.items.len;
         if (count <= 1) return;
 
-        const step: usize = switch (direction) {
-            .previous, .left, .up => count - 1,
-            .next, .right, .down => 1,
-        };
+        // next/previous walk the pane list, the four directions move to the
+        // nearest pane on that side of the focused one.
+        switch (direction) {
+            .next, .previous => {
+                const step: usize = if (direction == .previous) count - 1 else 1;
+                self.selectPane(tab_index, (tab.active + step) % count);
+            },
 
-        self.selectPane(tab_index, (tab.active + step) % count);
+            .left, .right, .up, .down => {
+                const current = paneRect(tab.panes.items[tab.active]) orelse return;
+                const current_cx = current.left + @divTrunc(current.right - current.left, 2);
+                const current_cy = current.top + @divTrunc(current.bottom - current.top, 2);
+
+                var best: ?usize = null;
+                var best_distance: i64 = std.math.maxInt(i64);
+
+                for (tab.panes.items, 0..) |pane, i| {
+                    if (i == tab.active) continue;
+                    const rect = paneRect(pane) orelse continue;
+
+                    const in_direction = switch (direction) {
+                        .left => rect.right <= current.left,
+                        .right => rect.left >= current.right,
+                        .up => rect.bottom <= current.top,
+                        .down => rect.top >= current.bottom,
+                        else => false,
+                    };
+                    if (!in_direction) continue;
+
+                    const cx = rect.left + @divTrunc(rect.right - rect.left, 2);
+                    const cy = rect.top + @divTrunc(rect.bottom - rect.top, 2);
+                    const dx: i64 = cx - current_cx;
+                    const dy: i64 = cy - current_cy;
+                    const distance = dx * dx + dy * dy;
+                    if (distance < best_distance) {
+                        best_distance = distance;
+                        best = i;
+                    }
+                }
+
+                if (best) |index| self.selectPane(tab_index, index);
+            },
+        }
+    }
+
+    /// Screen rectangle of a pane window, if it has one.
+    fn paneRect(pane: *Surface) ?RECT {
+        var rect: RECT = undefined;
+        if (GetWindowRect(pane.hwnd, &rect) == 0) return null;
+        return rect;
     }
 
     fn selectPane(self: *Frame, tab_index: usize, pane_index: usize) void {
