@@ -945,10 +945,10 @@ pub const App = struct {
             },
 
             .render => {
-                // The render thread exported a new frame; ask the window to
-                // repaint and pull it in the paint handler.
+                // The render thread exported a new frame. Present it right
+                // here instead of asking for a paint and doing it later.
                 if (target == .surface) {
-                    _ = InvalidateRect(target.surface.rt_surface.hwnd, null, 0);
+                    _ = target.surface.rt_surface.presentFrame();
                 }
                 return true;
             },
