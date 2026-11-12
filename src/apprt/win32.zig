@@ -134,6 +134,7 @@ extern "user32" fn SetWindowTextW(hWnd: HWND, lpString: LPCWSTR) callconv(.c) BO
 extern "user32" fn SetTimer(hWnd: HWND, nIDEvent: usize, uElapse: UINT, lpTimerFunc: ?*const anyopaque) callconv(.c) usize;
 extern "user32" fn KillTimer(hWnd: HWND, uIDEvent: usize) callconv(.c) BOOL;
 extern "user32" fn SetFocus(hWnd: ?HWND) callconv(.c) ?HWND;
+extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.c) BOOL;
 extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: LPCWSTR) callconv(.c) ?HCURSOR;
 extern "user32" fn AdjustWindowRectEx(lpRect: *RECT, dwStyle: DWORD, bMenu: BOOL, dwExStyle: DWORD) callconv(.c) BOOL;
 extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.c) BOOL;
@@ -156,6 +157,19 @@ extern "gdi32" fn StretchDIBits(
 
 extern "gdi32" fn PatBlt(hdc: HDC, x: c_int, y: c_int, w: c_int, h: c_int, rop: DWORD) callconv(.c) BOOL;
 
+extern "user32" fn GetKeyState(nVirtKey: c_int) callconv(.c) i16;
+extern "user32" fn GetKeyboardState(lpKeyState: *[256]u8) callconv(.c) BOOL;
+extern "user32" fn ToUnicodeEx(
+    wVirtKey: UINT,
+    wScanCode: UINT,
+    lpKeyState: *const [256]u8,
+    pwszBuff: [*]u16,
+    cchBuff: c_int,
+    wFlags: UINT,
+    dwhkl: ?*anyopaque,
+) callconv(.c) c_int;
+extern "user32" fn MapVirtualKeyW(uCode: UINT, uMapType: UINT) callconv(.c) UINT;
+
 // Window messages we care about.
 const WM_DESTROY: UINT = 0x0002;
 const WM_SIZE: UINT = 0x0005;
@@ -164,6 +178,12 @@ const WM_KILLFOCUS: UINT = 0x0008;
 const WM_PAINT: UINT = 0x000F;
 const WM_CLOSE: UINT = 0x0010;
 const WM_TIMER: UINT = 0x0113;
+const WM_KEYDOWN: UINT = 0x0100;
+const WM_KEYUP: UINT = 0x0101;
+const WM_CHAR: UINT = 0x0102;
+const WM_SYSKEYDOWN: UINT = 0x0104;
+const WM_SYSKEYUP: UINT = 0x0105;
+const WM_SYSCHAR: UINT = 0x0106;
 const WM_ERASEBKGND: UINT = 0x0014;
 const WM_APP_WAKEUP: UINT = 0x8001;
 
@@ -174,6 +194,13 @@ const SW_SHOW: c_int = 5;
 const GWLP_USERDATA: c_int = -21;
 const IDC_ARROW: LPCWSTR = @ptrFromInt(32512);
 const SRCCOPY: DWORD = 0x00CC_0020;
+
+const VK_SHIFT: c_int = 0x10;
+const VK_CONTROL: c_int = 0x11;
+const VK_MENU: c_int = 0x12;
+const VK_CAPITAL: c_int = 0x14;
+const VK_NUMLOCK: c_int = 0x90;
+const VK_F4: UINT = 0x73;
 const BLACKNESS: DWORD = 0x0000_0042;
 
 /// Default window size in pixels. The core recomputes its grid from this,
@@ -254,6 +281,11 @@ pub const App = struct {
         _ = ShowWindow(surface.hwnd, SW_SHOW);
         _ = ShowWindow(surface.hwnd, SW_SHOW);
         _ = UpdateWindow(surface.hwnd);
+
+        // Claim focus: the process that launched us (a console, Explorer)
+        // is usually the foreground window, and Windows allows that
+        // process to hand focus to the window it just started.
+        _ = SetForegroundWindow(surface.hwnd);
         _ = SetFocus(surface.hwnd);
 
         _ = SetTimer(surface.hwnd, 1, tick_interval_ms, null);
@@ -528,6 +560,37 @@ pub const Surface = struct {
         _ = SetWindowTextW(self.hwnd, wide.ptr);
     }
 
+    /// Translate a Win32 virtual key into a core key event.
+    ///
+    /// Text is generated here rather than from WM_CHAR so that the core
+    /// sees one event carrying both the physical key and the produced
+    /// text, which is what its key encoder expects for things like
+    /// Ctrl+C (physical `c` plus text is what makes 0x03).
+    fn handleKey(self: *Surface, vk: u32, extended: bool, action: input.Action) bool {
+        const mods = currentMods();
+
+        var text_buf: [8]u8 = undefined;
+        const text: []const u8 = switch (action) {
+            .press, .repeat => textForVk(vk, mods, &text_buf),
+            .release => "",
+        };
+
+        const event: input.KeyEvent = .{
+            .action = action,
+            .key = keyFromVk(vk, extended),
+            .mods = mods,
+            // Shift is consumed when it changed the produced character.
+            .consumed_mods = .{ .shift = mods.shift and text.len > 0 },
+            .utf8 = text,
+        };
+
+        const effect = self.core_surface.keyCallback(event) catch |err| {
+            log.err("key callback failed err={}", .{err});
+            return false;
+        };
+        return effect == .consumed;
+    }
+
     /// Pull the latest exported frame and blit it into the window.
     fn presentFrame(self: *Surface) void {
         const frame = self.core_surface.renderer.takeFrame() orelse {
@@ -538,16 +601,6 @@ pub const Surface = struct {
 
         switch (frame) {
             .memory => |m| {
-                self.frame_count +%= 1;
-                if (self.frame_count % 60 == 1) {
-                    var max: u8 = 0;
-                    for (m.pixels) |b| {
-                        if (b > max) max = b;
-                    }
-                    log.debug("frame {d} {d}x{d} max_byte={d}", .{
-                        self.frame_count, m.width, m.height, max,
-                    });
-                }
                 self.blit(m);
             },
             // There is no DMABUF path on Windows.
@@ -638,6 +691,35 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
             return 0;
         },
 
+        WM_KEYDOWN, WM_SYSKEYDOWN => {
+            const vk: u32 = @intCast(wParam & 0xFFFF);
+
+            // Let the system handle Alt+F4 and friends.
+            if (msg == WM_SYSKEYDOWN and vk == VK_F4) {
+                return DefWindowProcW(hwnd, msg, wParam, lParam);
+            }
+
+            const repeat = (lParam & (@as(LPARAM, 1) << 30)) != 0;
+            const extended = (lParam & (@as(LPARAM, 1) << 24)) != 0;
+            _ = self.handleKey(vk, extended, if (repeat) .repeat else .press);
+            return 0;
+        },
+
+        WM_KEYUP, WM_SYSKEYUP => {
+            const vk: u32 = @intCast(wParam & 0xFFFF);
+            if (msg == WM_SYSKEYUP and vk == VK_F4) {
+                return DefWindowProcW(hwnd, msg, wParam, lParam);
+            }
+
+            const extended = (lParam & (@as(LPARAM, 1) << 24)) != 0;
+            _ = self.handleKey(vk, extended, .release);
+            return 0;
+        },
+
+        // Text already travelled with the key event above; swallowing
+        // WM_CHAR keeps it from being inserted twice.
+        WM_CHAR, WM_SYSCHAR => return 0,
+
         WM_SETFOCUS => {
             self.core_surface.focusCallback(true) catch {};
             return 0;
@@ -703,6 +785,76 @@ fn surfaceFromWindow(hwnd: HWND) ?*Surface {
     const value = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if (value == 0) return null;
     return @ptrFromInt(@as(usize, @bitCast(value)));
+}
+
+/// The modifier state for the current input message.
+fn currentMods() input.Mods {
+    var mods: input.Mods = .{};
+    mods.shift = (GetKeyState(VK_SHIFT) & @as(i16, @bitCast(@as(u16, 0x8000)))) != 0;
+    mods.ctrl = (GetKeyState(VK_CONTROL) & @as(i16, @bitCast(@as(u16, 0x8000)))) != 0;
+    mods.alt = (GetKeyState(VK_MENU) & @as(i16, @bitCast(@as(u16, 0x8000)))) != 0;
+    mods.super = (GetKeyState(0x5B) & @as(i16, @bitCast(@as(u16, 0x8000)))) != 0 or
+        (GetKeyState(0x5C) & @as(i16, @bitCast(@as(u16, 0x8000)))) != 0;
+    mods.caps_lock = (GetKeyState(VK_CAPITAL) & 1) != 0;
+    mods.num_lock = (GetKeyState(VK_NUMLOCK) & 1) != 0;
+    return mods;
+}
+
+/// Map a Win32 virtual key to the physical key the core understands. The
+/// keycode table carries the Windows VK column for exactly this purpose.
+fn keyFromVk(vk: u32, extended: bool) input.Key {
+    // The keycode table's Windows column holds scan codes (with the 0xE0
+    // prefix for extended keys), not virtual key codes.
+    const base = MapVirtualKeyW(vk, 0);
+    const scan: u32 = if (extended and base != 0) 0xE000 | base else base;
+
+    for (input.keycodes.entries) |entry| {
+        if (entry.native == scan) return entry.key;
+    }
+
+    // Some keys are not flagged extended by Windows but the table only
+    // carries one form; accept the base code as a fallback.
+    for (input.keycodes.entries) |entry| {
+        if (entry.native == base) return entry.key;
+    }
+
+    return .unidentified;
+}
+
+/// The UTF-8 text produced by pressing `vk` with the given modifiers.
+///
+/// Control and Alt combos produce no text: the core derives their encoding
+/// from the physical key so that Ctrl+C becomes 0x03 rather than "c".
+fn textForVk(vk: u32, mods: input.Mods, buf: *[8]u8) []const u8 {
+    if (mods.ctrl or mods.alt or mods.super) return "";
+
+    var state: [256]u8 = undefined;
+    if (GetKeyboardState(&state) == 0) return "";
+
+    // ToUnicodeEx only accepts 0 or 1 for the toggle keys.
+    state[@intCast(VK_CAPITAL)] &= 1;
+    state[@intCast(VK_NUMLOCK)] &= 1;
+
+    var wide: [8]u16 = undefined;
+    const n = ToUnicodeEx(
+        vk,
+        MapVirtualKeyW(vk, 0),
+        &state,
+        &wide,
+        wide.len,
+        0,
+        null,
+    );
+    if (n <= 0) return "";
+
+    const len: usize = @min(@as(usize, @intCast(n)), wide.len);
+    const cp_len = std.unicode.utf16LeToUtf8(buf, wide[0..len]) catch return "";
+    if (cp_len == 0) return "";
+
+    // Control characters are encoded from the key, not as text.
+    if (buf[0] < 0x20) return "";
+
+    return buf[0..cp_len];
 }
 
 test {

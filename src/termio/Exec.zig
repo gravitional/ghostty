@@ -127,6 +127,7 @@ pub fn threadEnter(
     errdefer internal_os.closePipe(pipe[1]);
 
     // Setup our stream so that we can write.
+    const write_handle = pty_fds.write;
     var stream = xev.Stream.initFd(pty_fds.write);
     errdefer stream.deinit();
 
@@ -148,6 +149,7 @@ pub fn threadEnter(
     td.backend = .{ .exec = .{
         .start = process_start,
         .write_stream = stream,
+        .write_handle = write_handle,
         .process = process,
         .read_thread = read_thread,
         .read_thread_pipe = pipe[1],
@@ -450,6 +452,26 @@ pub fn queueWrite(
 
         //for (slice) |b| log.warn("write: {x}", .{b});
 
+        if (comptime builtin.target.os.tag == .windows) {
+            // CONPTY input is small and infrequent, so a blocking
+            // WriteFile is simpler (and works) where libxev cannot.
+            var written: internal_os.windows.DWORD = 0;
+            if (internal_os.windows.exp.kernel32.WriteFile(
+                exec.write_handle,
+                @ptrCast(@constCast(slice.ptr)),
+                @intCast(slice.len),
+                &written,
+                null,
+            ) == internal_os.windows.FALSE) {
+                log.err("write to pty failed error={d}", .{
+                    internal_os.windows.GetLastError(),
+                });
+            }
+
+            exec.write_pool.destroy(w);
+            continue;
+        }
+
         exec.write_stream.queueWrite(
             td.loop,
             &exec.write_queue,
@@ -507,6 +529,12 @@ pub const ThreadData = struct {
 
     /// The data stream is the main IO for the pty.
     write_stream: xev.Stream,
+
+    /// The raw pty write handle. On Windows the pty is a CONPTY pipe
+    /// HANDLE that libxev cannot drive (its fd backend calls libc
+    /// `write`, which does not accept HANDLEs), so writes go through
+    /// WriteFile directly.
+    write_handle: posix.fd_t = undefined,
 
     /// The process watcher
     process: ?xev.Process,
