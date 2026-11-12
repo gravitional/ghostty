@@ -45,6 +45,7 @@ const HWND = *opaque {};
 const HDC = *opaque {};
 const HMENU = *opaque {};
 const HICON = *opaque {};
+const HIMC = *opaque {};
 const HCURSOR = *opaque {};
 const HBRUSH = *opaque {};
 const LPVOID = ?*anyopaque;
@@ -147,6 +148,15 @@ extern "user32" fn SetWindowPos(
 extern "user32" fn SetProcessDpiAwarenessContext(value: ?*anyopaque) callconv(.c) BOOL;
 extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.c) UINT;
 extern "user32" fn GetSystemMetrics(nIndex: c_int) callconv(.c) c_int;
+
+extern "imm32" fn ImmGetContext(hWnd: HWND) callconv(.c) ?HIMC;
+extern "imm32" fn ImmReleaseContext(hWnd: HWND, hIMC: HIMC) callconv(.c) BOOL;
+extern "imm32" fn ImmGetCompositionStringW(
+    hIMC: HIMC,
+    dwIndex: DWORD,
+    lpBuf: ?*anyopaque,
+    dwBufLen: DWORD,
+) callconv(.c) i32;
 extern "user32" fn SetCapture(hWnd: HWND) callconv(.c) ?HWND;
 extern "user32" fn OpenClipboard(hWndNewOwner: ?HWND) callconv(.c) BOOL;
 extern "user32" fn CloseClipboard() callconv(.c) BOOL;
@@ -236,6 +246,21 @@ const SW_HIDE: c_int = 0;
 const GWLP_USERDATA: c_int = -21;
 const IDC_ARROW: LPCWSTR = @ptrFromInt(32512);
 const SRCCOPY: DWORD = 0x00CC_0020;
+
+const WM_IME_SETCONTEXT: UINT = 0x0281;
+const WM_IME_STARTCOMPOSITION: UINT = 0x010D;
+const WM_IME_ENDCOMPOSITION: UINT = 0x010E;
+const WM_IME_COMPOSITION: UINT = 0x010F;
+
+/// Ask the IME not to draw its own composition window; Ghostty renders
+/// the preedit inline in the terminal grid.
+const ISC_SHOWUICOMPOSITIONWINDOW: LPARAM = 0x8000_0000;
+
+const GCS_COMPSTR: DWORD = 0x0008;
+const GCS_RESULTSTR: DWORD = 0x0800;
+
+/// Windows reports this virtual key for keys the IME already consumed.
+const VK_PROCESSKEY: u32 = 0xE5;
 
 const CF_UNICODETEXT: UINT = 13;
 const GMEM_MOVEABLE: UINT = 0x0002;
@@ -423,6 +448,9 @@ pub const Surface = struct {
     content_scale: apprt.ContentScale,
     cursor_pos: apprt.CursorPos,
     title: ?[:0]const u8 = null,
+
+    /// True while an IME composition string is active.
+    composing: bool = false,
 
     /// Scratch buffer for the BGRA, top-down copy we hand to GDI.
     pixels: []u8 = &.{},
@@ -681,6 +709,12 @@ pub const Surface = struct {
     /// text, which is what its key encoder expects for things like
     /// Ctrl+C (physical `c` plus text is what makes 0x03).
     fn handleKey(self: *Surface, vk: u32, extended: bool, action: input.Action) bool {
+        // The IME owns the keyboard while composing, and keys it already
+        // consumed arrive as VK_PROCESSKEY; forwarding them would both
+        // double-insert text and trigger spurious keybindings.
+        if (self.composing) return true;
+        if (vk == VK_PROCESSKEY) return true;
+
         const mods = currentMods();
 
         var text_buf: [8]u8 = undefined;
@@ -741,6 +775,41 @@ pub const Surface = struct {
         self.core_surface.scrollCallback(xoff, yoff, .{}) catch |err| {
             log.err("error in scroll callback err={}", .{err});
         };
+    }
+
+    /// Replace the inline preedit text. A null/empty value clears it.
+    fn setPreedit(self: *Surface, text: ?[]const u8) void {
+        self.composing = text != null and text.?.len > 0;
+        self.core_surface.preeditCallback(text) catch |err| {
+            log.err("error in preedit callback err={}", .{err});
+        };
+    }
+
+    /// Handle a WM_IME_COMPOSITION update.
+    ///
+    /// A committed result is inserted like pasted text; the remaining
+    /// composition string becomes the inline preedit.
+    fn imeComposition(self: *Surface, himc: HIMC, flags: DWORD) void {
+        const alloc = self.app.core_app.alloc;
+
+        if (flags & GCS_RESULTSTR != 0) {
+            if (readImeString(alloc, himc, GCS_RESULTSTR)) |text| {
+                defer alloc.free(text);
+                self.core_surface.textCallback(text) catch |err| {
+                    log.err("error in text callback err={}", .{err});
+                };
+                self.setPreedit(null);
+            }
+        }
+
+        if (flags & GCS_COMPSTR != 0) {
+            if (readImeString(alloc, himc, GCS_COMPSTR)) |text| {
+                defer alloc.free(text);
+                self.setPreedit(text);
+            } else {
+                self.setPreedit("");
+            }
+        }
     }
 
     /// Pull the latest exported frame and blit it into the window.
@@ -875,6 +944,34 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
             return 0;
         },
 
+        WM_IME_SETCONTEXT => {
+            return DefWindowProcW(
+                hwnd,
+                msg,
+                wParam,
+                lParam & ~ISC_SHOWUICOMPOSITIONWINDOW,
+            );
+        },
+
+        WM_IME_STARTCOMPOSITION => {
+            self.setPreedit("");
+            return 0;
+        },
+
+        WM_IME_COMPOSITION => {
+            const himc = ImmGetContext(hwnd) orelse return 0;
+            defer _ = ImmReleaseContext(hwnd, himc);
+
+            const flags: DWORD = @truncate(@as(usize, @bitCast(lParam)));
+            self.imeComposition(himc, flags);
+            return 0;
+        },
+
+        WM_IME_ENDCOMPOSITION => {
+            self.setPreedit(null);
+            return 0;
+        },
+
         WM_KEYDOWN, WM_SYSKEYDOWN => {
             const vk: u32 = @intCast(wParam & 0xFFFF);
 
@@ -988,6 +1085,27 @@ fn surfaceFromWindow(hwnd: HWND) ?*Surface {
     const value = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if (value == 0) return null;
     return @ptrFromInt(@as(usize, @bitCast(value)));
+}
+
+/// Read an IME composition string as NUL-terminated UTF-8.
+///
+/// `ImmGetCompositionStringW` reports a byte length, and returns the
+/// number of bytes copied, so both calls are converted to UTF-16 units.
+fn readImeString(alloc: Allocator, himc: HIMC, index: DWORD) ?[:0]u8 {
+    const bytes = ImmGetCompositionStringW(himc, index, null, 0);
+    if (bytes <= 0) return null;
+
+    const units = alloc.alloc(u16, @intCast(@divTrunc(bytes, 2))) catch return null;
+    defer alloc.free(units);
+
+    const got = ImmGetCompositionStringW(himc, index, @ptrCast(units.ptr), @intCast(bytes));
+    if (got <= 0) return null;
+
+    const slice = units[0..@intCast(@divTrunc(got, 2))];
+    const utf8 = std.unicode.utf16LeToUtf8Alloc(alloc, slice) catch return null;
+    defer alloc.free(utf8);
+
+    return alloc.dupeSentinel(u8, utf8, 0) catch null;
 }
 
 /// Read the clipboard as a NUL-terminated UTF-8 string, or null when it

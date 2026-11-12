@@ -697,6 +697,7 @@ pub fn add(
             step.root_module.linkSystemLibrary("opengl32", .{});
             step.root_module.linkSystemLibrary("gdi32", .{});
             step.root_module.linkSystemLibrary("user32", .{});
+            step.root_module.linkSystemLibrary("imm32", .{});
         }
 
         // Link EGL for GTK.
