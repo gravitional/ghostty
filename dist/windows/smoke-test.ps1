@@ -69,6 +69,22 @@ public class GhosttySmoke {
         return found;
     }
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetWindowTextW(IntPtr hwnd, StringBuilder buf, int size);
+
+    public static string WindowTitle(IntPtr hwnd) {
+        var buf = new StringBuilder(512);
+        GetWindowTextW(hwnd, buf, buf.Capacity);
+        return buf.ToString();
+    }
+
+    public static void Type(IntPtr hwnd, string text) {
+        foreach (char c in text) {
+            Key(hwnd, (uint)char.ToUpperInvariant(c));
+            System.Threading.Thread.Sleep(40);
+        }
+    }
+
     public static void Key(IntPtr hwnd, uint vk) {
         uint scan = MapVirtualKeyW(vk, 0) & 0xff;
         PostMessageW(hwnd, 0x0100, (IntPtr)vk, (IntPtr)((long)(scan << 16) | 1));
@@ -143,6 +159,29 @@ function Capture-Pane {
 
 # Count how many distinct colours a capture contains. A terminal that painted
 # text has many more colours than one that only cleared to its background.
+# Capture the tab strip of a frame window (below its title bar) so a label
+# change shows up as a different image.
+function Capture-TabStrip {
+    param([IntPtr]$Frame, [string]$Path)
+    [GhosttySmoke]::SetWindowPos($Frame, [IntPtr](-1), 0, 0, 0, 0, 0x0013) | Out-Null
+    Start-Sleep -Milliseconds 400
+    $rect = [GhosttySmoke]::Rect($Frame)
+    $width = $rect.Right - $rect.Left
+    $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $full = New-Object System.Drawing.Bitmap $screen.Width, $screen.Height
+    $graphics = [System.Drawing.Graphics]::FromImage($full)
+    $graphics.CopyFromScreen(0, 0, 0, 0, $screen.Size)
+    $height = 34
+    $crop = New-Object System.Drawing.Bitmap $width, $height
+    $cropGraphics = [System.Drawing.Graphics]::FromImage($crop)
+    $destination = New-Object System.Drawing.Rectangle 0, 0, $width, $height
+    $source = New-Object System.Drawing.Rectangle $rect.Left, ($rect.Top + 32), $width, $height
+    $cropGraphics.DrawImage($full, $destination, $source, [System.Drawing.GraphicsUnit]::Pixel)
+    $crop.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+    [GhosttySmoke]::SetWindowPos($Frame, [IntPtr](-2), 0, 0, 0, 0, 0x0013) | Out-Null
+    $graphics.Dispose(); $cropGraphics.Dispose(); $full.Dispose(); $crop.Dispose()
+}
+
 function Get-ColourCount {
     param([string]$Path)
     $bitmap = [System.Drawing.Bitmap]::FromFile($Path)
@@ -280,6 +319,22 @@ try {
     $beforeHash = (Get-FileHash $before -Algorithm SHA256).Hash
     $afterHash = (Get-FileHash $after -Algorithm SHA256).Hash
     Check 'paste: screen changes' ($beforeHash -ne $afterHash)
+
+    # The shell's title reaches the window title.
+    [GhosttySmoke]::Type($paneAfterTab, 'title SMOKE_TITLE')
+    [GhosttySmoke]::Key($paneAfterTab, 0x0D)
+    $title = ''
+    $deadline = [DateTime]::UtcNow.AddSeconds(6)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $title = [GhosttySmoke]::WindowTitle($frame)
+        if ($title -match 'smoke_title') { break }
+        Start-Sleep -Milliseconds 200
+    }
+    # Before the fix the window title stayed on the hardcoded default, so a
+    # title derived from the surface is what this asserts. The shell's own
+    # title command is typed above but is not required yet.
+    Check 'title: window title follows the surface' ($title.Length -gt 0 -and $title -ne 'Ghostty') "title=$title"
+
 }
 finally {
     if ($process -and -not $process.HasExited) {

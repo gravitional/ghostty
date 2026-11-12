@@ -1116,6 +1116,14 @@ pub const Frame = struct {
             _ = SetWindowPos(active.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             _ = SetFocus(active.hwnd);
             active.core_surface.refreshCallback() catch {};
+
+            if (self.titles.items[index].len > 0) {
+                const label = std.unicode.utf16LeToUtf8Alloc(self.app.core_app.alloc, self.titles.items[index]) catch null;
+                if (label) |text| {
+                    defer self.app.core_app.alloc.free(text);
+                    self.setWindowTitle(text);
+                }
+            }
         }
 
         _ = InvalidateRect(self.tab_bar, null, 1);
@@ -1291,6 +1299,10 @@ pub const Frame = struct {
         self.titles.items[index] = copy;
 
         _ = InvalidateRect(self.tab_bar, null, 1);
+
+        // Keep the host window title on the active tab so the taskbar shows
+        // what the user is actually looking at.
+        if (index == self.active) self.setWindowTitle(title);
     }
 
     /// Set the host window title.
