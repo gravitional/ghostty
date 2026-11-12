@@ -92,6 +92,9 @@ public class GhosttySmoke {
         }
     }
 
+    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hwnd, out RECT rect);
+    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern int GetWindowTextW(IntPtr hwnd, StringBuilder buf, int size);
 
@@ -135,7 +138,7 @@ $extraKeybinds = @(
     'keybind = f9=new_split:right',
     'keybind = f5=close_surface',
     'keybind = f11=toggle_fullscreen',
-    'keybind = f4=paste_from_clipboard'
+    'keybind = f4=paste_from_clipboard`nkeybind = f8=scroll_page_up'
 )
 
 function Wait-Until {
@@ -151,39 +154,27 @@ function Wait-Until {
 
 function Capture-Pane {
     param([IntPtr]$Pane, [string]$Path)
-    # The window has to be on top for a screen grab to show it.
-    [GhosttySmoke]::SetWindowPos($Pane, [IntPtr](-1), 0, 0, 0, 0, 0x0013) | Out-Null
-    Start-Sleep -Milliseconds 400
-    $rect = [GhosttySmoke]::Rect($Pane)
+    # PrintWindow renders the window itself, so the capture does not depend
+    # on where the window is on screen or what overlaps it. Screen grabs of
+    # a popup pane were the source of several flaky checks.
+    $rect = New-Object GhosttySmoke+RECT
+    [GhosttySmoke]::GetClientRect($Pane, [ref]$rect) | Out-Null
     $width = $rect.Right - $rect.Left
-    $height = [Math]::Min(160, $rect.Bottom - $rect.Top)
-    if ($width -le 0 -or $height -le 0) {
-        [GhosttySmoke]::SetWindowPos($Pane, [IntPtr](-2), 0, 0, 0, 0, 0x0013) | Out-Null
-        throw "pane has no area: ${width}x${height}"
+    $height = $rect.Bottom - $rect.Top
+    if ($width -le 0 -or $height -le 0) { throw "pane has no area: ${width}x${height}" }
+    $bitmap = New-Object System.Drawing.Bitmap $width, $height
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    $hdc = $graphics.GetHdc()
+    try {
+        # PW_RENDERFULLCONTENT renders windows drawn through DirectComposition.
+        [GhosttySmoke]::PrintWindow($Pane, $hdc, 2) | Out-Null
+    } finally {
+        $graphics.ReleaseHdc($hdc)
     }
-    $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-    $full = New-Object System.Drawing.Bitmap $screen.Width, $screen.Height
-    $graphics = [System.Drawing.Graphics]::FromImage($full)
-    $graphics.CopyFromScreen(0, 0, 0, 0, $screen.Size)
-    $crop = New-Object System.Drawing.Bitmap $width, $height
-    $cropGraphics = [System.Drawing.Graphics]::FromImage($crop)
-    $cropGraphics.DrawImage(
-        $full,
-        (New-Object System.Drawing.Rectangle 0, 0, $width, $height),
-        (New-Object System.Drawing.Rectangle $rect.Left, $rect.Top, $width, $height),
-        [System.Drawing.GraphicsUnit]::Pixel)
-    $crop.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
-    [GhosttySmoke]::SetWindowPos($Pane, [IntPtr](-2), 0, 0, 0, 0, 0x0013) | Out-Null
+    $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
     $graphics.Dispose()
-    $cropGraphics.Dispose()
-    $full.Dispose()
-    $crop.Dispose()
+    $bitmap.Dispose()
 }
-
-# Count how many distinct colours a capture contains. A terminal that painted
-# text has many more colours than one that only cleared to its background.
-# Capture the tab strip of a frame window (below its title bar) so a label
-# change shows up as a different image.
 function Capture-TabStrip {
     param([IntPtr]$Frame, [string]$Path)
     [GhosttySmoke]::SetWindowPos($Frame, [IntPtr](-1), 0, 0, 0, 0, 0x0013) | Out-Null
@@ -265,18 +256,20 @@ try {
     [GhosttySmoke]::Type($pane, 'set')
     [GhosttySmoke]::Key($pane, 0x0D)
     Start-Sleep -Seconds 3
-    [GhosttySmoke]::SetForegroundWindow($pane) | Out-Null
+    # Scrolling back through history changes what is on screen. `set` is used
+    # as the output generator because the typing helper can only send letters,
+    # and a key binding is used instead of the wheel because a synthetic wheel
+    # event depends on which window happens to be under the cursor.
+    [GhosttySmoke]::Type($pane, 'set')
+    [GhosttySmoke]::Key($pane, 0x0D)
+    Start-Sleep -Seconds 3
     $scrollBefore = Join-Path $work 'scroll-before.png'
     Capture-Pane -Pane $pane -Path $scrollBefore
-    $rect = [GhosttySmoke]::Rect($pane)
-    [GhosttySmoke]::Wheel(
-        $rect.Left + [int](($rect.Right - $rect.Left) / 2),
-        $rect.Top + [int](($rect.Bottom - $rect.Top) / 2),
-        15)
-    Start-Sleep -Seconds 1
+    for ($i = 0; $i -lt 8; $i++) { [GhosttySmoke]::Key($pane, 0x77); Start-Sleep -Milliseconds 120 }
+    Start-Sleep -Milliseconds 500
     $scrollAfter = Join-Path $work 'scroll-after.png'
     Capture-Pane -Pane $pane -Path $scrollAfter
-    Check 'scrollback: wheel changes the view' (
+    Check 'scrollback: scrolling changes the view' (
         (Get-FileHash $scrollBefore -Algorithm SHA256).Hash -ne
         (Get-FileHash $scrollAfter -Algorithm SHA256).Hash)
 
