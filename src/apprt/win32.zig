@@ -371,6 +371,12 @@ const WM_RBUTTONUP: UINT = 0x0205;
 const WM_MBUTTONDOWN: UINT = 0x0207;
 const WM_MBUTTONUP: UINT = 0x0208;
 const WM_MOUSEWHEEL: UINT = 0x020A;
+
+/// After this many ticks without a presented frame the presentation cadence
+/// slows down. 60 ticks is about one second at the 16ms tick.
+const IDLE_TICKS_THRESHOLD: u32 = 60;
+/// While idle, only every Nth tick asks the renderer to draw.
+const IDLE_TICK_SKIP: u32 = 8;
 const WM_XBUTTONDOWN: UINT = 0x020B;
 const WM_XBUTTONUP: UINT = 0x020C;
 const WM_SYSKEYDOWN: UINT = 0x0104;
@@ -448,6 +454,10 @@ pub const App = struct {
 
     /// Every open window.
     frames: std.ArrayListUnmanaged(*Frame) = .empty,
+
+    /// Ticks since a pane last presented a frame, used to slow the
+    /// presentation cadence while the terminal is idle.
+    idle_ticks: u32 = 0,
 
     /// Every open surface, across all windows.
     surfaces: std.ArrayListUnmanaged(*Surface) = .empty,
@@ -977,6 +987,10 @@ pub const Frame = struct {
     /// Whether the frame is borderless fullscreen.
     fullscreen: bool = false,
 
+    /// Ticks since a pane last presented a frame, used to slow the
+    /// presentation cadence while the terminal is idle.
+    idle_ticks: u32 = 0,
+
     /// Window rect to go back to when leaving fullscreen.
     saved_rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
 
@@ -1245,12 +1259,22 @@ pub const Frame = struct {
             // Wake the render thread so it draws whatever changed, then ask
             // for a paint so the newest frame is blitted.
             // The renderer only redraws when it is asked to, so a tick
-            // without this refresh would never produce a frame.
-            pane.core_surface.refreshCallback() catch {};
-
-            // Present directly instead of invalidating: InvalidateRect made
-            // the window repaint whether or not a frame was ready.
-            pane.presentFrame();
+            // without this refresh would never produce a frame. Asking on
+            // every tick while nothing changes is wasteful, so back off to a
+            // slow cadence when nothing has been drawn for a while; any input
+            // or delivered frame brings the fast cadence back.
+            if (self.idle_ticks >= IDLE_TICKS_THRESHOLD and
+                (self.idle_ticks % IDLE_TICK_SKIP) != 0)
+            {
+                self.idle_ticks += 1;
+            } else {
+                pane.core_surface.refreshCallback() catch {};
+                if (pane.presentFrame()) {
+                    self.idle_ticks = 0;
+                } else {
+                    self.idle_ticks += 1;
+                }
+            }
         }
     }
 
@@ -2052,9 +2076,9 @@ pub const Surface = struct {
     }
 
     /// Pull the latest exported frame and blit it into the window.
-    fn presentFrame(self: *Surface) void {
+    fn presentFrame(self: *Surface) bool {
         const frame = self.core_surface.renderer.takeFrame() orelse {
-            return;
+            return false;
         };
 
         defer frame.deinit();
@@ -2068,6 +2092,8 @@ pub const Surface = struct {
             // There is no DMABUF path on Windows.
             .dmabuf => {},
         }
+
+        return true;
     }
 
     fn blit(self: *Surface, m: renderer.OpenGL.ExportedFrame.Memory) void {
@@ -2287,7 +2313,7 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
                     log.err("error requesting refresh err={}", .{err});
                 };
             } else {
-                self.presentFrame();
+                _ = self.presentFrame();
             }
 
             _ = ValidateRect(hwnd, null);
