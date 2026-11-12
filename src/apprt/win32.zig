@@ -452,6 +452,11 @@ pub const App = struct {
     /// Every open surface, across all windows.
     surfaces: std.ArrayListUnmanaged(*Surface) = .empty,
 
+    /// Configurations replaced by a reload. Surfaces may keep references
+    /// into the config they were updated with, so the replaced ones are only
+    /// released when the app shuts down.
+    retired_configs: std.ArrayListUnmanaged(Config) = .empty,
+
     pub const Options = struct {};
 
     /// There is no cross-process IPC channel on Windows yet, so CLI
@@ -824,6 +829,28 @@ pub const App = struct {
 
             .close_all_windows => {
                 for (self.frames.items) |frame| frame.closeAll();
+                return true;
+            },
+
+            .reload_config => {
+                var config = Config.load(self.core_app.alloc) catch |err| {
+                    log.warn("config reload failed err={}", .{err});
+                    return false;
+                };
+                defer config.deinit();
+
+                for (self.surfaces.items) |surface| {
+                    surface.core_surface.updateConfig(&config) catch |err| {
+                        log.warn("updateConfig failed err={}", .{err});
+                    };
+                }
+
+                // Keep the replaced config alive: surfaces may still refer
+                // into it.
+                self.retired_configs.append(self.core_app.alloc, self.config) catch {
+                    return true;
+                };
+                self.config = config;
                 return true;
             },
 
