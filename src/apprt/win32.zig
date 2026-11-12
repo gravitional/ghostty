@@ -1268,7 +1268,10 @@ pub const Frame = struct {
                     if (ti < self.titles.items.len) alloc.free(self.titles.orderedRemove(ti));
 
                     if (self.tabs.items.len == 0) {
-                        _ = DestroyWindow(self.hwnd);
+                        // Destroying the frame here would destroy it from
+                        // inside a pane's WM_DESTROY, which nested the
+                        // destruction and crashed. Ask for it instead.
+                        _ = PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
                         return;
                     }
 
