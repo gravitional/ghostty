@@ -728,6 +728,16 @@ pub const App = struct {
                 return false;
             },
 
+            .close_tab => {
+                if (target == .surface) {
+                    const surface = target.surface.rt_surface;
+                    if (surface.frame) |frame| {
+                        if (frame.tabIndex(surface)) |index| frame.closeTab(index);
+                    }
+                }
+                return true;
+            },
+
             .set_title => {
                 if (target == .surface) {
                     target.surface.rt_surface.setTitle(value.title);
@@ -779,6 +789,7 @@ pub const Frame = struct {
     const tab_class = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyTabBar");
     const tab_height: i32 = 28;
     const tab_width: i32 = 170;
+    const close_width: i32 = 22;
 
     fn create(app: *App) !*Frame {
         const alloc = app.core_app.alloc;
@@ -989,6 +1000,33 @@ pub const Frame = struct {
         }
     }
 
+    /// Update the label of the tab a surface belongs to.
+    fn setTitle(self: *Frame, surface: *Surface, title: []const u8) void {
+        const index = self.tabIndex(surface) orelse return;
+        if (index >= self.titles.items.len) return;
+
+        const alloc = self.app.core_app.alloc;
+        const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, title) catch return;
+        defer alloc.free(wide);
+
+        const copy = alloc.dupe(u16, wide[0..wide.len]) catch return;
+        alloc.free(self.titles.items[index]);
+        self.titles.items[index] = copy;
+
+        _ = InvalidateRect(self.tab_bar, null, 1);
+    }
+
+    /// Close every pane of a tab.
+    fn closeTab(self: *Frame, index: usize) void {
+        if (index >= self.tabs.items.len) return;
+
+        const alloc = self.app.core_app.alloc;
+        const panes = alloc.dupe(*Surface, self.tabs.items[index].panes.items) catch return;
+        defer alloc.free(panes);
+
+        for (panes) |pane| pane.core_surface.close();
+    }
+
     fn closeAll(self: *Frame) void {
         // Ask the core to close each pane; a surface destroys its own
         // window as it goes, and the last one destroys the frame.
@@ -1052,7 +1090,22 @@ fn tabBarProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
             const x: i32 = @intCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
             const index = @divTrunc(x, Frame.tab_width);
             if (index >= 0 and index < frame.tabs.items.len) {
-                frame.selectTab(@intCast(index));
+                // The right edge of a tab is its close button.
+                const tab_right = (index + 1) * Frame.tab_width;
+                if (x >= tab_right - Frame.close_width) {
+                    frame.closeTab(@intCast(index));
+                } else {
+                    frame.selectTab(@intCast(index));
+                }
+            }
+            return 0;
+        },
+
+        WM_MBUTTONDOWN => {
+            const x: i32 = @intCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
+            const index = @divTrunc(x, Frame.tab_width);
+            if (index >= 0 and index < frame.tabs.items.len) {
+                frame.closeTab(@intCast(index));
             }
             return 0;
         },
@@ -1096,6 +1149,22 @@ fn paintTabBar(frame: *Frame, hwnd: HWND) void {
                 _ = DeleteObject(brush);
             }
         }
+
+        // Close button: a small x at the right edge of the tab.
+        var close_rect: RECT = .{
+            .left = rect.right - Frame.close_width,
+            .top = 0,
+            .right = rect.right,
+            .bottom = client.bottom,
+        };
+        var close_label = std.unicode.utf8ToUtf16LeStringLiteral("x");
+        _ = DrawTextW(
+            dc,
+            close_label[0..].ptr,
+            1,
+            &close_rect,
+            0x1 | 0x4 | 0x20,
+        );
 
         _ = SetTextColor(dc, GetSysColor(18)); // COLOR_BTNTEXT
         _ = DrawTextW(
@@ -1420,6 +1489,7 @@ pub const Surface = struct {
     }
 
     pub fn setTitle(self: *Surface, title: [:0]const u8) void {
+        log.debug("set_title {s}", .{title});
         const alloc = self.app.core_app.alloc;
         if (self.title) |v| alloc.free(v);
 
@@ -1429,6 +1499,8 @@ pub const Surface = struct {
         const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, owned) catch return;
         defer alloc.free(wide);
         _ = SetWindowTextW(self.hwnd, wide.ptr);
+
+        if (self.frame) |frame| frame.setTitle(self, title);
     }
 
     /// Translate a Win32 virtual key into a core key event.
