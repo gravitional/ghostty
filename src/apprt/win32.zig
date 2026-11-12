@@ -1181,6 +1181,9 @@ pub const Frame = struct {
     fn invalidatePanes(self: *Frame) void {
         if (self.active >= self.tabs.items.len) return;
         for (self.tabs.items[self.active].panes.items) |pane| {
+            // Wake the render thread so it draws whatever changed, then ask
+            // for a paint so the newest frame is blitted.
+            pane.core_surface.refreshCallback() catch {};
             _ = InvalidateRect(pane.hwnd, null, 0);
         }
     }
