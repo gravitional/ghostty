@@ -1581,6 +1581,12 @@ pub const Surface = struct {
     }
 
     pub fn refresh(self: *Surface) void {
+        // The renderer produced a new frame; ask the window to paint so the
+        // UI thread pulls it and presents. Without this a surface that never
+        // gets a paint (a window that is not being moved or uncovered) would
+        // render frames that nobody ever shows.
+        _ = InvalidateRect(self.hwnd, null, 0);
+
         self.core_surface.refreshCallback() catch |err| {
             log.err("error in refresh callback err={}", .{err});
         };
