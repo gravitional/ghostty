@@ -140,6 +140,24 @@ extern "user32" fn PostMessageW(hWnd: ?HWND, msg: UINT, wParam: WPARAM, lParam: 
 extern "user32" fn PostQuitMessage(nExitCode: c_int) callconv(.c) void;
 extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: c_int, dwNewLong: LONG_PTR) callconv(.c) LONG_PTR;
 extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: c_int) callconv(.c) LONG_PTR;
+
+const GWL_STYLE: c_int = -16;
+const WS_CAPTION: DWORD = 0x00C0_0000;
+const WS_THICKFRAME: DWORD = 0x0004_0000;
+const SWP_FRAMECHANGED: UINT = 0x0020;
+const SWP_SHOWWINDOW: UINT = 0x0040;
+const MONITOR_DEFAULTTONEAREST: DWORD = 2;
+
+const MONITORINFO = extern struct {
+    cbSize: DWORD,
+    rcMonitor: RECT,
+    rcWork: RECT,
+    dwFlags: DWORD,
+};
+
+extern "user32" fn GetWindowRect(hWnd: HWND, lpRect: *RECT) callconv(.c) BOOL;
+extern "user32" fn MonitorFromWindow(hWnd: HWND, dwFlags: DWORD) callconv(.c) HWND;
+extern "user32" fn GetMonitorInfoW(hMonitor: HWND, lpmi: *MONITORINFO) callconv(.c) BOOL;
 extern "user32" fn SetWindowTextW(hWnd: HWND, lpString: LPCWSTR) callconv(.c) BOOL;
 extern "user32" fn SetTimer(hWnd: HWND, nIDEvent: usize, uElapse: UINT, lpTimerFunc: ?*const anyopaque) callconv(.c) usize;
 extern "user32" fn KillTimer(hWnd: HWND, uIDEvent: usize) callconv(.c) BOOL;
@@ -799,9 +817,15 @@ pub const App = struct {
                 return true;
             },
 
-            .toggle_maximize, .toggle_fullscreen => {
-                // Fullscreen is implemented as a maximized window for now.
+            .toggle_maximize => {
                 if (self.targetFrame(target)) |frame| toggleMaximize(frame);
+                return true;
+            },
+
+            .toggle_fullscreen => {
+                if (self.targetFrame(target)) |frame| {
+                    frame.setFullscreen(!frame.fullscreen);
+                }
                 return true;
             },
 
@@ -883,6 +907,12 @@ pub const Frame = struct {
     hwnd: HWND,
     tab_bar: HWND,
     tabs: std.ArrayListUnmanaged(Tab) = .empty,
+    /// Whether the frame is borderless fullscreen.
+    fullscreen: bool = false,
+
+    /// Window rect to go back to when leaving fullscreen.
+    saved_rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+
     /// Tab labels, UTF-16 so they can be drawn without conversion.
     titles: std.ArrayListUnmanaged([]u16) = .empty,
     active: usize = 0,
@@ -1061,6 +1091,53 @@ pub const Frame = struct {
                 .bottom = if (row == rows - 1) rect.bottom else rect.top + (row + 1) * height,
             });
         }
+    }
+
+    /// Enter or leave borderless fullscreen: the window loses its frame and
+    /// covers the monitor it is on, then goes back to exactly where it was.
+    fn setFullscreen(self: *Frame, on: bool) void {
+        if (self.fullscreen == on) return;
+
+        var style: usize = @bitCast(GetWindowLongPtrW(self.hwnd, GWL_STYLE));
+        const chrome: usize = WS_CAPTION | WS_THICKFRAME;
+
+        if (on) {
+            var rect: RECT = undefined;
+            if (GetWindowRect(self.hwnd, &rect) == 0) return;
+            self.saved_rect = rect;
+
+            const monitor = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
+            var info: MONITORINFO = undefined;
+            info.cbSize = @sizeOf(MONITORINFO);
+            if (GetMonitorInfoW(monitor, &info) == 0) return;
+
+            style &= ~chrome;
+            _ = SetWindowLongPtrW(self.hwnd, GWL_STYLE, @bitCast(style));
+            _ = SetWindowPos(
+                self.hwnd,
+                HWND_TOP,
+                info.rcMonitor.left,
+                info.rcMonitor.top,
+                info.rcMonitor.right - info.rcMonitor.left,
+                info.rcMonitor.bottom - info.rcMonitor.top,
+                SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+            );
+        } else {
+            style |= chrome;
+            _ = SetWindowLongPtrW(self.hwnd, GWL_STYLE, @bitCast(style));
+            _ = SetWindowPos(
+                self.hwnd,
+                HWND_TOP,
+                self.saved_rect.left,
+                self.saved_rect.top,
+                self.saved_rect.right - self.saved_rect.left,
+                self.saved_rect.bottom - self.saved_rect.top,
+                SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+            );
+        }
+
+        self.fullscreen = on;
+        self.layout();
     }
 
     fn layout(self: *Frame) void {
