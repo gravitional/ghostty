@@ -43,10 +43,9 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     // OS-specific
     switch (cfg.target.result.os.tag) {
         .windows => {
-            // TODO(win32): Zig's `main` entry point needs the console
-            // subsystem because libcmt's GUI startup expects `WinMain`.
-            // Switch to `.windows` once a WinMain shim exists.
-            exe.subsystem = if (cfg.app_runtime == .win32) .console else .windows;
+            // The Win32 runtime exports its own WinMain (see main.zig) so
+            // it can use the GUI subsystem and never allocate a console.
+            exe.subsystem = .windows;
             exe.root_module.addWin32ResourceFile(.{
                 .file = b.path("dist/windows/ghostty.rc"),
             });

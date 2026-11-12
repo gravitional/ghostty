@@ -146,8 +146,7 @@ extern "user32" fn SetWindowPos(
 ) callconv(.c) BOOL;
 extern "user32" fn SetProcessDpiAwarenessContext(value: ?*anyopaque) callconv(.c) BOOL;
 extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.c) UINT;
-extern "user32" fn GetConsoleWindow() callconv(.c) ?HWND;
-extern "kernel32" fn GetConsoleProcessList(lpdwProcessList: [*]DWORD, dwProcessCount: DWORD) callconv(.c) DWORD;
+extern "user32" fn GetSystemMetrics(nIndex: c_int) callconv(.c) c_int;
 extern "user32" fn SetCapture(hWnd: HWND) callconv(.c) ?HWND;
 extern "user32" fn OpenClipboard(hWndNewOwner: ?HWND) callconv(.c) BOOL;
 extern "user32" fn CloseClipboard() callconv(.c) BOOL;
@@ -224,7 +223,6 @@ const WM_APP_WAKEUP: UINT = 0x8001;
 
 const WS_OVERLAPPEDWINDOW: DWORD = 0x00CF_0000;
 const WS_VISIBLE: DWORD = 0x1000_0000;
-const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x8000_0000));
 const SWP_NOZORDER: UINT = 0x0004;
 
 /// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, a pseudo-handle with the
@@ -316,8 +314,6 @@ pub const App = struct {
     }
 
     pub fn run(self: *App) !void {
-        hideOwnedConsole();
-
         // Opt into per-monitor DPI scaling before any window exists so
         // that coordinates and fonts are in real device pixels. Without
         // this Windows bitmap-stretches the whole window.
@@ -471,15 +467,20 @@ pub const Surface = struct {
         };
         _ = AdjustWindowRectEx(&rect, WS_OVERLAPPEDWINDOW, 0, 0);
 
+        const win_w = rect.right - rect.left;
+        const win_h = rect.bottom - rect.top;
+        const pos_x = @max(0, @divTrunc(GetSystemMetrics(0) - win_w, 2));
+        const pos_y = @max(0, @divTrunc(GetSystemMetrics(1) - win_h, 2));
+
         const hwnd = CreateWindowExW(
             0,
             class_name,
             std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            pos_x,
+            pos_y,
+            win_w,
+            win_h,
             null,
             null,
             hinstance,
@@ -1056,22 +1057,6 @@ fn buttonFromMsg(msg: UINT, wParam: WPARAM) input.MouseButton {
             else => .unknown,
         },
     };
-}
-
-/// Hide the console window when this process created it.
-///
-/// The executable currently links with the console subsystem so that
-/// Zig's `main` entry point works; a GUI launch from Explorer would
-/// otherwise leave a stray console next to the window. When the process
-/// was started from an existing terminal the console is shared (more than
-/// one attached process), so it is left alone and logs stay visible.
-fn hideOwnedConsole() void {
-    var pids: [2]DWORD = undefined;
-    if (GetConsoleProcessList(&pids, pids.len) != 1) return;
-
-    if (GetConsoleWindow()) |console| {
-        _ = ShowWindow(console, SW_HIDE);
-    }
 }
 
 /// The modifier state for the current input message.

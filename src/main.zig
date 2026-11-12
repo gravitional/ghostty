@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_config = @import("build_config.zig");
 
 /// See build_config.ExeEntrypoint for why we do this.
@@ -14,6 +15,46 @@ const entrypoint = switch (build_config.exe_entrypoint) {
 
 /// The main entrypoint for the program.
 pub const main = entrypoint.main;
+
+// Export a WinMain for the GUI subsystem. Without it libcmt's GUI startup
+// has no entry point.
+comptime {
+    if (builtin.target.os.tag == .windows and
+        build_config.artifact == .exe and
+        build_config.app_runtime == .win32)
+    {
+        @export(&winMain, .{ .name = "WinMain" });
+    }
+}
+
+/// Windows GUI entry point.
+///
+/// With the `.windows` subsystem the C runtime starts at `WinMain`
+/// instead of `main`, so we construct the same minimal process state that
+/// Zig's console startup would have built from the PEB. This keeps a
+/// console window from being allocated at all for the Win32 runtime.
+fn winMain(
+    hinstance: *anyopaque,
+    prev_instance: ?*anyopaque,
+    cmdline: [*:0]u8,
+    show: c_int,
+) callconv(.c) c_int {
+    _ = hinstance;
+    _ = prev_instance;
+    _ = cmdline;
+    _ = show;
+
+    const params = std.os.windows.peb().ProcessParameters;
+    main(.{
+        .args = .{ .vector = params.CommandLine.slice() },
+        .environ = .{ .block = std.process.Environ.Block.global },
+    }) catch |err| {
+        std.debug.print("ghostty: fatal error: {}\n", .{err});
+        return 1;
+    };
+
+    return 0;
+}
 
 /// Standard options such as logger overrides.
 pub const std_options: std.Options = if (@hasDecl(entrypoint, "std_options"))
