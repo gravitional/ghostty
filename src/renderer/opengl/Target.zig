@@ -248,12 +248,16 @@ pub fn readPixelsAlloc(self: *const Self, alloc: std.mem.Allocator) ![]u8 {
     const pixels = try alloc.alloc(u8, self.width * self.height * 4);
     errdefer alloc.free(pixels);
 
+    // Read BGRA directly: the one consumer (the Win32 runtime) hands the
+    // pixels to GDI and to a D3D11 BGRA back buffer, both of which want
+    // BGRA, so reading it directly avoids a per-pixel channel swap on the
+    // CPU for every frame.
     try gl.readPixels(
         0,
         0,
         @intCast(self.width),
         @intCast(self.height),
-        .rgba,
+        .bgra,
         .unsigned_byte,
         pixels.ptr,
     );

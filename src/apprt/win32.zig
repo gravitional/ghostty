@@ -885,20 +885,15 @@ pub const Surface = struct {
             };
         }
 
-        // `readPixels` returns bottom-up RGBA; GDI wants top-down BGRA.
+        // `readPixels` returns bottom-up BGRA; both presentation paths want
+        // it the other way up, so only the rows have to be reversed.
         const src_stride = @as(usize, m.width) * 4;
         const dst_stride = src_stride;
         var y: usize = 0;
         while (y < m.height) : (y += 1) {
             const src_row = m.pixels[(m.height - 1 - y) * src_stride ..][0..src_stride];
             const dst_row = self.pixels[y * dst_stride ..][0..dst_stride];
-            var x: usize = 0;
-            while (x < src_stride) : (x += 4) {
-                dst_row[x + 0] = src_row[x + 2];
-                dst_row[x + 1] = src_row[x + 1];
-                dst_row[x + 2] = src_row[x + 0];
-                dst_row[x + 3] = src_row[x + 3];
-            }
+            @memcpy(dst_row, src_row);
         }
 
         self.presentPixels(m.width, m.height);
