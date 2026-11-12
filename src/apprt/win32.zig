@@ -2135,6 +2135,16 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
         WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_XBUTTONDOWN => {
             const p = mousePos(lParam);
             self.cursorPosCallback(p.x, p.y);
+
+            // Middle click pastes unless the application captured the
+            // mouse, which is what users of other terminals expect.
+            if (msg == WM_MBUTTONDOWN and !self.core_surface.mouseCaptured()) {
+                _ = self.core_surface.pasteFromClipboard() catch |err| {
+                    log.debug("middle click paste failed err={}", .{err});
+                };
+                return 0;
+            }
+
             _ = SetCapture(hwnd);
             self.mouseButtonCallback(.press, buttonFromMsg(msg, wParam));
             return 0;

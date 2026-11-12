@@ -5256,10 +5256,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
-        .paste_from_clipboard => return (try self.startClipboardRequest(
-            .standard,
-            .{ .paste = .standard },
-        )) == .started,
+        .paste_from_clipboard => return try self.pasteFromClipboard(),
 
         .paste_from_selection => return (try self.startClipboardRequest(
             .selection,
@@ -6235,6 +6232,15 @@ pub fn denyClipboardRequest(self: *Surface, req: apprt.ClipboardRequest) void {
 /// weren't started never complete. Callers own reacting to that, e.g.
 /// performable paste keybinds pass through and Kitty clipboard reads
 /// answer the program.
+/// Paste the standard clipboard, as the paste_from_clipboard binding does.
+/// Returns true if a request was started.
+pub fn pasteFromClipboard(self: *Surface) !bool {
+    return (try self.startClipboardRequest(
+        .standard,
+        .{ .paste = .standard },
+    )) == .started;
+}
+
 fn startClipboardRequest(
     self: *Surface,
     loc: apprt.Clipboard,
