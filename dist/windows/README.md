@@ -25,6 +25,26 @@ window. For development, switching `exe.subsystem` to `.console` in
 - Multiple windows and single-instance IPC (`+new-tab`, `+new-window`)
 - Config reload at runtime, font zoom, working directory passthrough
 - The shell's title reaching the tab label and the window title
+- Minimize and restore without losing the screen; the process exits when the
+  last shell does
+
+## Measured behaviour
+
+Debug build on a 2560x1440 display at 100% scale:
+
+| Scenario | CPU |
+| --- | --- |
+| Idle | ~3% of one core |
+| A burst of output (`set` in cmd) | ~10% |
+| Back to idle after the burst | ~3% |
+
+Memory settled around 100 MB with 15 threads.
+
+The presentation tick asks the renderer to draw every 16 ms, because nothing
+else pulls frames. After a second without a presented frame it backs off to
+every eighth tick, and any key press or presented frame restores the fast
+cadence.
+
 
 ## Architecture notes
 
@@ -112,7 +132,18 @@ Notes for anyone extending it:
 
 - Window titles update from the shell, but shells that report a title only
   through the console API (rather than OSC) are not covered.
-- Long output is roughly 35% of one core in a debug build, mostly the CPU copy
-  path.
+- Only a single 100%-scale display has been tested. Mixed-DPI setups and moving
+  a window between monitors with different scales are unverified.
 - No Windows-specific default key bindings are provided; configure shortcuts in
   the config file as you would on any other platform.
+- The tab bar cannot be observed well enough from outside the process to assert
+  tab operations, so the smoke test does not cover them. Closing a tab and
+  closing from the tab bar were verified by hand.
+
+## Measuring geometry
+
+Measure window rectangles only from a DPI-aware process. A DPI-unaware caller
+gets virtualized values (28 physical pixels at 150% reads back as 19), which
+once looked like a layout bug for several rounds. `SetProcessDpiAwarenessContext(-4)`
+before any measurement.
+
