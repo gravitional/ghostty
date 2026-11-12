@@ -149,6 +149,15 @@ extern "user32" fn SetProcessDpiAwarenessContext(value: ?*anyopaque) callconv(.c
 extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.c) UINT;
 extern "user32" fn GetSystemMetrics(nIndex: c_int) callconv(.c) c_int;
 
+extern fn ghostty_d3d11_create(hwnd: HWND, width: c_int, height: c_int) callconv(.c) ?*anyopaque;
+extern fn ghostty_d3d11_present(
+    presenter: *anyopaque,
+    bgra: [*]const u8,
+    width: c_int,
+    height: c_int,
+) callconv(.c) c_int;
+extern fn ghostty_d3d11_destroy(presenter: *anyopaque) callconv(.c) void;
+
 extern "imm32" fn ImmGetContext(hWnd: HWND) callconv(.c) ?HIMC;
 extern "imm32" fn ImmReleaseContext(hWnd: HWND, hIMC: HIMC) callconv(.c) BOOL;
 extern "imm32" fn ImmGetCompositionStringW(
@@ -384,6 +393,7 @@ pub const App = struct {
         // The core tears its own surface down when the shell exits (it
         // stops the render and IO threads before we get here), so we only
         // release the memory this runtime allocated.
+        surface.destroyPresenter();
         if (surface.pixels.len > 0) alloc.free(surface.pixels);
         if (surface.title) |title| alloc.free(title);
         alloc.destroy(surface);
@@ -440,6 +450,16 @@ pub const App = struct {
 // Surface
 // ---------------------------------------------------------------------------
 
+/// How finished CPU frames reach the screen.
+const Presenter = union(enum) {
+    /// GDI `StretchDIBits`. Always available; the fallback.
+    gdi,
+
+    /// D3D11 swap chain (see `win32/d3d11.c`). Uploads the frame into the
+    /// back buffer and presents with vsync.
+    d3d11: *anyopaque,
+};
+
 pub const Surface = struct {
     app: *App,
     core_surface: CoreSurface,
@@ -448,6 +468,9 @@ pub const Surface = struct {
     content_scale: apprt.ContentScale,
     cursor_pos: apprt.CursorPos,
     title: ?[:0]const u8 = null,
+
+    /// How frames are presented (D3D11 when available, GDI otherwise).
+    presenter: Presenter = .gdi,
 
     /// True while an IME composition string is active.
     composing: bool = false,
@@ -537,6 +560,16 @@ pub const Surface = struct {
             self.content_scale = .{ .x = scale, .y = scale };
         }
 
+        // Prefer the swap chain; fall back to GDI when D3D11 is missing
+        // (no GPU, old driver, remote session).
+        self.presenter = if (ghostty_d3d11_create(
+            hwnd,
+            @intCast(self.size.width),
+            @intCast(self.size.height),
+        )) |presenter| .{ .d3d11 = presenter } else .gdi;
+
+        log.debug("presenter={s}", .{@tagName(self.presenter)});
+
         // Register with the core before initializing so that callbacks can
         // find us.
         try app.core_app.addSurface(self);
@@ -556,6 +589,7 @@ pub const Surface = struct {
     }
 
     pub fn deinit(self: *Surface) void {
+        self.destroyPresenter();
         if (self.title) |v| self.app.core_app.alloc.free(v);
         self.app.core_app.deleteSurface(self);
         self.core_surface.deinit();
@@ -777,6 +811,16 @@ pub const Surface = struct {
         };
     }
 
+    fn destroyPresenter(self: *Surface) void {
+        switch (self.presenter) {
+            .d3d11 => |presenter| {
+                ghostty_d3d11_destroy(presenter);
+                self.presenter = .gdi;
+            },
+            .gdi => {},
+        }
+    }
+
     /// Replace the inline preedit text. A null/empty value clears it.
     fn setPreedit(self: *Surface, text: ?[]const u8) void {
         self.composing = text != null and text.?.len > 0;
@@ -861,6 +905,25 @@ pub const Surface = struct {
     }
 
     fn presentPixels(self: *Surface, width: u32, height: u32) void {
+        switch (self.presenter) {
+            .d3d11 => |presenter| {
+                if (ghostty_d3d11_present(
+                    presenter,
+                    self.pixels.ptr,
+                    @intCast(width),
+                    @intCast(height),
+                ) != 0) return;
+
+                // Device lost or the upload failed; keep painting rather
+                // than leaving a frozen window.
+                log.warn("d3d11 presentation failed, falling back to GDI", .{});
+                ghostty_d3d11_destroy(presenter);
+                self.presenter = .gdi;
+            },
+
+            .gdi => {},
+        }
+
         const hdc = GetDC(self.hwnd) orelse return;
         defer _ = ReleaseDC(self.hwnd, hdc);
 
@@ -1037,6 +1100,14 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
         },
 
         WM_ERASEBKGND => {
+            // With a swap chain there is nothing to erase: the presented
+            // frame covers the client area, and GDI painting here would
+            // flash black between frames.
+            switch (self.presenter) {
+                .d3d11 => return 1,
+                .gdi => {},
+            }
+
             self.clearBackground();
             return 1;
         },
