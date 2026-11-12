@@ -2247,21 +2247,6 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
             return 0;
         },
 
-        WM_TIMER => {
-            if (app_instance) |app| {
-                app.core_app.tick(app) catch |err| {
-                    log.err("core tick failed err={}", .{err});
-                };
-                for (app.frames.items) |f| {
-                    if (f.hwnd == hwnd) {
-                        f.invalidatePanes();
-                        break;
-                    }
-                }
-            }
-            return 0;
-        },
-
         WM_APP_WAKEUP => {
             if (app_instance) |app| {
                 app.core_app.tick(app) catch |err| {
