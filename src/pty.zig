@@ -441,13 +441,27 @@ const WindowsPty = struct {
         try SetHandleInformation.f(pty.out_pipe);
         try SetHandleInformation.f(pty.out_pipe_pty);
 
-        const result = windows.exp.kernel32.CreatePseudoConsole(
+        // PSEUDOCONSOLE_PASSTHROUGH lets the application's own VT output,
+        // including OSC titles, reach the terminal instead of being consumed
+        // by conhost. It only exists on recent Windows, so fall back to the
+        // translated mode when the call rejects it.
+        const PSEUDOCONSOLE_PASSTHROUGH: windows.DWORD = 0x0000_0001;
+        var result = windows.exp.kernel32.CreatePseudoConsole(
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
             pty.in_pipe_pty,
             pty.out_pipe_pty,
-            0,
+            PSEUDOCONSOLE_PASSTHROUGH,
             &pty.pseudo_console,
         );
+        if (result != windows.S_OK) {
+            result = windows.exp.kernel32.CreatePseudoConsole(
+                .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
+                pty.in_pipe_pty,
+                pty.out_pipe_pty,
+                0,
+                &pty.pseudo_console,
+            );
+        }
         if (result != windows.S_OK) return error.Unexpected;
 
         pty.size = size;
