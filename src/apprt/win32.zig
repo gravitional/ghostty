@@ -1039,7 +1039,19 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
         },
 
         WM_PAINT => {
-            self.presentFrame();
+            // Once frames are presented by the renderer there is no frame
+            // to blit here: the window back buffer already holds the last
+            // one. A paint request therefore means the window lost its
+            // contents (occlusion, unminimize), so ask the core to render
+            // again instead of leaving a stale or blank window.
+            if (self.gl_presented) {
+                self.core_surface.refreshCallback() catch |err| {
+                    log.err("error requesting refresh err={}", .{err});
+                };
+            } else {
+                self.presentFrame();
+            }
+
             _ = ValidateRect(hwnd, null);
             return 0;
         },
