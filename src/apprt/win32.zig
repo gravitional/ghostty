@@ -149,6 +149,64 @@ extern "user32" fn SetProcessDpiAwarenessContext(value: ?*anyopaque) callconv(.c
 extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.c) UINT;
 extern "user32" fn GetSystemMetrics(nIndex: c_int) callconv(.c) c_int;
 
+extern "kernel32" fn CreateNamedPipeW(
+    lpName: LPCWSTR,
+    dwOpenMode: DWORD,
+    dwPipeMode: DWORD,
+    nMaxInstances: DWORD,
+    nOutBufferSize: DWORD,
+    nInBufferSize: DWORD,
+    nDefaultTimeOut: DWORD,
+    lpSecurityAttributes: ?*anyopaque,
+) callconv(.c) HANDLE;
+extern "kernel32" fn ConnectNamedPipe(hNamedPipe: HANDLE, lpOverlapped: ?*anyopaque) callconv(.c) BOOL;
+extern "kernel32" fn DisconnectNamedPipe(hNamedPipe: HANDLE) callconv(.c) BOOL;
+extern "kernel32" fn ReadFile(
+    hFile: HANDLE,
+    lpBuffer: ?*anyopaque,
+    nNumberOfBytesToRead: DWORD,
+    lpNumberOfBytesRead: ?*DWORD,
+    lpOverlapped: ?*anyopaque,
+) callconv(.c) BOOL;
+extern "kernel32" fn WriteFile(
+    hFile: HANDLE,
+    lpBuffer: ?*const anyopaque,
+    nNumberOfBytesToWrite: DWORD,
+    lpNumberOfBytesWritten: ?*DWORD,
+    lpOverlapped: ?*anyopaque,
+) callconv(.c) BOOL;
+extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.c) BOOL;
+extern "kernel32" fn GetLastError() callconv(.c) u32;
+extern "kernel32" fn CreateFileW(
+    lpFileName: LPCWSTR,
+    dwDesiredAccess: DWORD,
+    dwShareMode: DWORD,
+    lpSecurityAttributes: ?*anyopaque,
+    dwCreationDisposition: DWORD,
+    dwFlagsAndAttributes: DWORD,
+    hTemplateFile: ?HANDLE,
+) callconv(.c) HANDLE;
+
+const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+const PIPE_ACCESS_INBOUND: DWORD = 0x0000_0001;
+const PIPE_TYPE_MESSAGE: DWORD = 0x0000_0004;
+const PIPE_READMODE_MESSAGE: DWORD = 0x0000_0002;
+const PIPE_WAIT: DWORD = 0x0000_0000;
+const GENERIC_WRITE: DWORD = 0x4000_0000;
+const OPEN_EXISTING: DWORD = 3;
+
+/// Posted by the IPC thread to the main window with the action tag in
+/// `wParam`.
+const WM_APP_IPC: UINT = 0x8000 + 2;
+
+/// Named pipe the first instance listens on.
+const ipc_pipe_name = std.unicode.utf8ToUtf16LeStringLiteral("\\\\.\\pipe\\ghostty-win32");
+
+const IpcTag = enum(u32) {
+    new_window = 1,
+    new_tab = 2,
+};
+
 extern "imm32" fn ImmGetContext(hWnd: HWND) callconv(.c) ?HIMC;
 extern "imm32" fn ImmReleaseContext(hWnd: HWND, hIMC: HIMC) callconv(.c) BOOL;
 extern "imm32" fn ImmGetCompositionStringW(
@@ -312,7 +370,33 @@ pub const App = struct {
         comptime action: apprt.ipc.Action.Key,
         _: apprt.ipc.Action.Value(action),
     ) !bool {
-        return false;
+        // Only actions this runtime can carry out are forwarded. Returning
+        // false lets the CLI report that the action is unsupported rather
+        // than pretending it was delivered.
+        const tag: IpcTag = switch (action) {
+            .new_window => .new_window,
+            else => return false,
+        };
+
+        const file = CreateFileW(
+            ipc_pipe_name,
+            GENERIC_WRITE,
+            0,
+            null,
+            OPEN_EXISTING,
+            0,
+            null,
+        );
+        if (file == INVALID_HANDLE_VALUE) return false;
+        defer _ = CloseHandle(file);
+
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u32, buf[0..4], @backingInt(tag), .little);
+        std.mem.writeInt(u32, buf[4..8], 0, .little);
+
+        var written: DWORD = 0;
+        if (WriteFile(file, &buf, buf.len, &written, null) == 0) return false;
+        return written == buf.len;
     }
 
     pub fn init(
@@ -352,6 +436,16 @@ pub const App = struct {
 
         // Create the initial window before entering the loop.
         _ = try self.createSurface();
+
+        // Accept commands from other processes (`ghostty +new-window`).
+        // The thread lives for the process lifetime; it blocks on
+        // ConnectNamedPipe and has no clean shutdown, which is fine because
+        // the process exit tears it down.
+        if (std.Thread.spawn(.{}, ipcServerMain, .{self})) |thread| {
+            thread.detach();
+        } else |err| {
+            log.warn("failed to start IPC thread err={}", .{err});
+        }
 
         var msg: MSG = .{};
         while (true) {
@@ -440,6 +534,24 @@ pub const App = struct {
         if (surface.pixels.len > 0) alloc.free(surface.pixels);
         if (surface.title) |title| alloc.free(title);
         alloc.destroy(surface);
+    }
+
+    /// Apply a command received over IPC.
+    fn handleIpc(self: *App, tag_raw: u32) void {
+        const tag: IpcTag = switch (tag_raw) {
+            1 => .new_window,
+            2 => .new_tab,
+            else => return,
+        };
+        switch (tag) {
+            .new_window => _ = self.createSurface() catch |err| {
+                log.err("failed to open window for IPC err={}", .{err});
+            },
+
+            // Tabs are not implemented yet; the client refuses to send
+            // this tag, so treat it as a no-op.
+            .new_tab => {},
+        }
     }
 
     /// Wake up the event loop so the core can process its mailbox.
@@ -1122,6 +1234,11 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
             return 1;
         },
 
+        WM_APP_IPC => {
+            if (app_instance) |app| app.handleIpc(@intCast(wParam));
+            return 0;
+        },
+
         WM_TIMER => {
             if (app_instance) |app| {
                 app.core_app.tick(app) catch |err| {
@@ -1325,4 +1442,40 @@ fn textForVk(vk: u32, mods: input.Mods, buf: *[8]u8) []const u8 {
 test {
     _ = App;
     _ = Surface;
+}
+
+/// Named-pipe server used to receive commands from other processes.
+fn ipcServerMain(app: *App) void {
+    while (true) {
+        const pipe = CreateNamedPipeW(
+            ipc_pipe_name,
+            PIPE_ACCESS_INBOUND,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+            1,
+            0,
+            1024,
+            0,
+            null,
+        );
+        if (pipe == INVALID_HANDLE_VALUE) {
+            log.err("failed to create IPC pipe error={d}", .{GetLastError()});
+            return;
+        }
+
+        const connected = ConnectNamedPipe(pipe, null) != 0 or
+            GetLastError() == 535; // ERROR_PIPE_CONNECTED
+        if (connected) {
+            var buf: [1024]u8 = undefined;
+            var read: DWORD = 0;
+            if (ReadFile(pipe, &buf, buf.len, &read, null) != 0 and read >= 8) {
+                const tag = std.mem.readInt(u32, buf[0..4], .little);
+                if (app.main_hwnd) |hwnd| {
+                    _ = PostMessageW(hwnd, WM_APP_IPC, @intCast(tag), 0);
+                }
+            }
+        }
+
+        _ = DisconnectNamedPipe(pipe);
+        _ = CloseHandle(pipe);
+    }
 }
