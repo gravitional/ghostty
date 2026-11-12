@@ -148,6 +148,43 @@ extern "user32" fn SetWindowPos(
 extern "user32" fn SetProcessDpiAwarenessContext(value: ?*anyopaque) callconv(.c) BOOL;
 extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.c) UINT;
 extern "user32" fn GetSystemMetrics(nIndex: c_int) callconv(.c) c_int;
+extern "user32" fn SendMessageW(hWnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c) LRESULT;
+extern "user32" fn MoveWindow(hWnd: HWND, x: c_int, y: c_int, w: c_int, h: c_int, repaint: BOOL) callconv(.c) BOOL;
+extern "user32" fn ClientToScreen(hWnd: HWND, lpPoint: *POINT) callconv(.c) BOOL;
+extern "comctl32" fn InitCommonControlsEx(picce: *const INITCOMMONCONTROLSEX) callconv(.c) BOOL;
+
+const INITCOMMONCONTROLSEX = extern struct {
+    dwSize: DWORD,
+    dwICC: DWORD,
+};
+
+const ICC_TAB_CLASSES: DWORD = 0x0008;
+const TCS_FOCUSNEVER: DWORD = 0x0001;
+const TCM_INSERTITEMW: UINT = 0x1307;
+const TCM_DELETEITEM: UINT = 0x1308;
+const TCM_GETCOUNT: UINT = 0x1304;
+const TCM_GETCURSEL: UINT = 0x130B;
+const TCM_SETCURSEL: UINT = 0x130C;
+const TCM_SETITEMSIZE: UINT = 0x1329;
+const TCIF_TEXT: UINT = 0x0001;
+const TCN_SELCHANGE: UINT = @bitCast(@as(i32, -551));
+const WM_NOTIFY: UINT = 0x004E;
+
+const NMHDR = extern struct {
+    hwndFrom: HWND,
+    idFrom: usize,
+    code: UINT,
+};
+
+const TCITEMW = extern struct {
+    mask: UINT = 0,
+    dwState: DWORD = 0,
+    dwStateMask: DWORD = 0,
+    pszText: ?LPWSTR = null,
+    cchTextMax: c_int = 0,
+    iImage: c_int = 0,
+    lParam: LPARAM = 0,
+};
 
 extern "kernel32" fn CreateNamedPipeW(
     lpName: LPCWSTR,
@@ -267,6 +304,17 @@ const WM_SIZE: UINT = 0x0005;
 const WM_SETFOCUS: UINT = 0x0007;
 const WM_KILLFOCUS: UINT = 0x0008;
 const WM_PAINT: UINT = 0x000F;
+const WS_CHILD: DWORD = 0x4000_0000;
+const WS_POPUP: DWORD = 0x8000_0000;
+const WS_CLIPSIBLINGS: DWORD = 0x0400_0000;
+const WS_CLIPCHILDREN: DWORD = 0x0200_0000;
+const SWP_NOSIZE: UINT = 0x0001;
+const SWP_NOMOVE: UINT = 0x0002;
+const WS_EX_TOOLWINDOW: DWORD = 0x0000_0080;
+const WM_MOVE: UINT = 0x0003;
+const HWND_TOP: ?HWND = @ptrFromInt(0);
+const LPWSTR = [*:0]u16;
+
 const WM_CLOSE: UINT = 0x0010;
 const WM_TIMER: UINT = 0x0113;
 const WM_DPICHANGED: UINT = 0x02E0;
@@ -357,6 +405,9 @@ pub const App = struct {
     main_hwnd: ?HWND = null,
 
     /// Every open window.
+    frames: std.ArrayListUnmanaged(*Frame) = .empty,
+
+    /// Every open surface, across all windows.
     surfaces: std.ArrayListUnmanaged(*Surface) = .empty,
 
     pub const Options = struct {};
@@ -375,6 +426,7 @@ pub const App = struct {
         // than pretending it was delivered.
         const tag: IpcTag = switch (action) {
             .new_window => .new_window,
+            .new_tab => .new_tab,
             else => return false,
         };
 
@@ -435,7 +487,7 @@ pub const App = struct {
         _ = SetProcessDpiAwarenessContext(dpi_aware_v2);
 
         // Create the initial window before entering the loop.
-        _ = try self.createSurface();
+        _ = try self.createFrame();
 
         // Accept commands from other processes (`ghostty +new-window`).
         // The thread lives for the process lifetime; it blocks on
@@ -461,56 +513,62 @@ pub const App = struct {
         }
 
         // Windows that were not closed through the normal path (a `.quit`
-        // action, for example) still own runtime memory. Destroying them
-        // runs WM_DESTROY synchronously, which frees each surface.
-        while (self.surfaces.items.len > 0) {
-            const surface = self.surfaces.items[self.surfaces.items.len - 1];
-            _ = DestroyWindow(surface.hwnd);
+        // action, for example) still own runtime memory. Destroying a frame
+        // closes its tabs, which frees everything.
+        while (self.frames.items.len > 0) {
+            _ = DestroyWindow(self.frames.items[0].hwnd);
         }
     }
 
-    /// Create, show and focus a new window.
-    fn createSurface(self: *App) !*Surface {
-        const alloc = self.core_app.alloc;
+    /// Create, show and focus a new window with one tab.
+    fn createFrame(self: *App) !*Frame {
+        const frame = try Frame.create(self);
+        errdefer self.destroyFrame(frame);
 
-        const surface = try alloc.create(Surface);
-        errdefer alloc.destroy(surface);
-        try surface.init(self, .{});
-        errdefer alloc.destroy(surface);
+        // Show the frame before creating its first tab so the popup is
+        // positioned and visible from the moment GL starts presenting.
+        _ = ShowWindow(frame.hwnd, SW_SHOW);
+        _ = ShowWindow(frame.hwnd, SW_SHOW);
+        _ = UpdateWindow(frame.hwnd);
 
-        try self.surfaces.append(alloc, surface);
+        _ = try self.createSurfaceIn(frame);
 
-        // The first ShowWindow call in a process uses STARTUPINFO's show
-        // state (often SW_HIDE for console-launched processes), so show
-        // again to make sure the window is really visible.
-        _ = ShowWindow(surface.hwnd, SW_SHOW);
-        _ = ShowWindow(surface.hwnd, SW_SHOW);
-        _ = UpdateWindow(surface.hwnd);
-
-        // Claim focus: the process that launched us (a console, Explorer)
-        // is usually the foreground window, and Windows allows that
-        // process to hand focus to the window it just started.
-        _ = SetForegroundWindow(surface.hwnd);
-        _ = SetFocus(surface.hwnd);
+        _ = SetForegroundWindow(frame.hwnd);
+        _ = SetFocus(frame.hwnd);
 
         // One timer drives the core tick for the whole process, so it is
         // owned by the main window.
         if (self.main_hwnd == null) {
-            self.main_hwnd = surface.hwnd;
-            _ = SetTimer(surface.hwnd, 1, tick_interval_ms, null);
+            self.main_hwnd = frame.hwnd;
+            _ = SetTimer(frame.hwnd, 1, tick_interval_ms, null);
         }
 
+        return frame;
+    }
+
+    /// Create a new tab in `frame` and focus it.
+    fn createSurfaceIn(self: *App, frame: *Frame) !*Surface {
+        const alloc = self.core_app.alloc;
+
+        const surface = try alloc.create(Surface);
+        errdefer alloc.destroy(surface);
+
+        try surface.init(self, .{
+            .owner = frame.hwnd,
+            .rect = frame.contentRect(),
+        });
+        errdefer alloc.destroy(surface);
+
+        try self.surfaces.append(alloc, surface);
+        errdefer _ = self.surfaces.pop();
+
+        try frame.addTab(surface);
         return surface;
     }
 
-    /// Release a window after it has been destroyed.
+    /// Release a surface after its window has been destroyed.
     fn destroySurface(self: *App, surface: *Surface) void {
         const alloc = self.core_app.alloc;
-
-        if (self.main_hwnd == surface.hwnd) {
-            _ = KillTimer(surface.hwnd, 1);
-            self.main_hwnd = null;
-        }
 
         for (self.surfaces.items, 0..) |item, i| {
             if (item == surface) {
@@ -519,11 +577,32 @@ pub const App = struct {
             }
         }
 
-        // Keep a window around to receive process-wide messages, and quit
-        // once the last one is gone.
+        if (surface.frame) |frame| frame.removeSurface(surface);
+
+        if (surface.pixels.len > 0) alloc.free(surface.pixels);
+        if (surface.title) |title| alloc.free(title);
+        alloc.destroy(surface);
+    }
+
+    /// Release a frame after its window has been destroyed.
+    fn destroyFrame(self: *App, frame: *Frame) void {
+        const alloc = self.core_app.alloc;
+
+        if (self.main_hwnd == frame.hwnd) {
+            _ = KillTimer(frame.hwnd, 1);
+            self.main_hwnd = null;
+        }
+
+        for (self.frames.items, 0..) |item, i| {
+            if (item == frame) {
+                _ = self.frames.swapRemove(i);
+                break;
+            }
+        }
+
         if (self.main_hwnd == null) {
-            if (self.surfaces.items.len > 0) {
-                const next = self.surfaces.items[0];
+            if (self.frames.items.len > 0) {
+                const next = self.frames.items[0];
                 self.main_hwnd = next.hwnd;
                 _ = SetTimer(next.hwnd, 1, tick_interval_ms, null);
             } else {
@@ -531,9 +610,7 @@ pub const App = struct {
             }
         }
 
-        if (surface.pixels.len > 0) alloc.free(surface.pixels);
-        if (surface.title) |title| alloc.free(title);
-        alloc.destroy(surface);
+        alloc.destroy(frame);
     }
 
     /// Apply a command received over IPC.
@@ -544,13 +621,18 @@ pub const App = struct {
             else => return,
         };
         switch (tag) {
-            .new_window => _ = self.createSurface() catch |err| {
+            .new_window => _ = self.createFrame() catch |err| {
                 log.err("failed to open window for IPC err={}", .{err});
             },
 
-            // Tabs are not implemented yet; the client refuses to send
-            // this tag, so treat it as a no-op.
-            .new_tab => {},
+            .new_tab => {
+                if (self.frames.items.len > 0) {
+                    const frame = self.frames.items[self.frames.items.len - 1];
+                    _ = self.createSurfaceIn(frame) catch |err| {
+                        log.err("failed to open tab for IPC err={}", .{err});
+                    };
+                }
+            },
         }
     }
 
@@ -579,8 +661,20 @@ pub const App = struct {
             },
 
             .new_window => {
-                _ = try self.createSurface();
+                _ = try self.createFrame();
                 return true;
+            },
+
+            .new_tab => {
+                const frame: ?*Frame = switch (target) {
+                    .surface => |surface| surface.rt_surface.frame,
+                    .app => if (self.frames.items.len > 0)
+                        self.frames.items[self.frames.items.len - 1]
+                    else
+                        null,
+                };
+                if (frame) |f| _ = try self.createSurfaceIn(f);
+                return frame != null;
             },
 
             .set_title => {
@@ -608,8 +702,264 @@ pub const App = struct {
 // Surface
 // ---------------------------------------------------------------------------
 
+/// A window hosting one or more tabbed terminal surfaces.
+///
+/// The frame owns the native tab control and the popup windows that make up
+/// the tab contents. Tabs are top-level popups owned by the frame rather
+/// than `WS_CHILD` windows because WGL only presents reliably on top-level
+/// windows.
+pub const Frame = struct {
+    app: *App,
+    hwnd: HWND,
+    tab_bar: HWND,
+    tabs: std.ArrayListUnmanaged(*Surface) = .empty,
+    active: usize = 0,
+
+    const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyFrame");
+    const tab_class = std.unicode.utf8ToUtf16LeStringLiteral("SysTabControl32");
+    const tab_id: usize = 1;
+    const tab_height: i32 = 28;
+
+    fn create(app: *App) !*Frame {
+        const alloc = app.core_app.alloc;
+        const hinstance = GetModuleHandleW(null);
+
+        var wc: WNDCLASSEXW = .{
+            .lpfnWndProc = frameProc,
+            .hInstance = hinstance,
+            .hCursor = LoadCursorW(null, IDC_ARROW),
+            .lpszClassName = class_name,
+        };
+        _ = RegisterClassExW(&wc);
+
+        const self = alloc.create(Frame) catch return error.OutOfMemory;
+        errdefer alloc.destroy(self);
+        self.* = .{ .app = app, .hwnd = undefined, .tab_bar = undefined };
+
+        var rect: RECT = .{
+            .left = 0,
+            .top = 0,
+            .right = @intCast(default_width),
+            .bottom = @intCast(default_height),
+        };
+        _ = AdjustWindowRectEx(&rect, WS_OVERLAPPEDWINDOW, 0, 0);
+        const win_w = rect.right - rect.left;
+        const win_h = rect.bottom - rect.top;
+        const pos_x = @max(0, @divTrunc(GetSystemMetrics(0) - win_w, 2));
+        const pos_y = @max(0, @divTrunc(GetSystemMetrics(1) - win_h, 2));
+
+        self.hwnd = CreateWindowExW(
+            0,
+            class_name,
+            std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,
+            pos_x,
+            pos_y,
+            win_w,
+            win_h,
+            null,
+            null,
+            hinstance,
+            self,
+        ) orelse return error.WindowCreateFailed;
+        _ = SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+
+        var icc: INITCOMMONCONTROLSEX = .{
+            .dwSize = @sizeOf(INITCOMMONCONTROLSEX),
+            .dwICC = ICC_TAB_CLASSES,
+        };
+        _ = InitCommonControlsEx(&icc);
+
+        self.tab_bar = CreateWindowExW(
+            0,
+            tab_class,
+            std.unicode.utf8ToUtf16LeStringLiteral(""),
+            WS_CHILD | WS_VISIBLE | TCS_FOCUSNEVER,
+            0,
+            0,
+            100,
+            tab_height,
+            self.hwnd,
+            @ptrFromInt(tab_id),
+            hinstance,
+            null,
+        ) orelse return error.WindowCreateFailed;
+
+        // Wide enough for a decent title, and one line high.
+        _ = SendMessageW(
+            self.tab_bar,
+            TCM_SETITEMSIZE,
+            0,
+            @intCast((@as(isize, 22) << 16) | @as(isize, 160)),
+        );
+
+        try app.frames.append(alloc, self);
+        return self;
+    }
+
+    /// Screen rectangle the tab contents occupy.
+    fn contentRect(self: *Frame) RECT {
+        var client: RECT = undefined;
+        if (GetClientRect(self.hwnd, &client) == 0) {
+            return .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        }
+
+        var origin = POINT{ .x = 0, .y = tab_height };
+        if (ClientToScreen(self.hwnd, &origin) == 0) {
+            return .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        }
+
+        return .{
+            .left = origin.x,
+            .top = origin.y,
+            .right = origin.x + (client.right - client.left),
+            .bottom = origin.y + (client.bottom - client.top - tab_height),
+        };
+    }
+
+    fn addTab(self: *Frame, surface: *Surface) !void {
+        const title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+        var item: TCITEMW = .{
+            .mask = TCIF_TEXT,
+            .pszText = @constCast(title.ptr),
+            .cchTextMax = @intCast(title.len),
+        };
+
+        const index = self.tabs.items.len;
+        _ = SendMessageW(self.tab_bar, TCM_INSERTITEMW, index, @intCast(@intFromPtr(&item)));
+        try self.tabs.append(self.app.core_app.alloc, surface);
+
+        surface.frame = self;
+        self.selectTab(index);
+        self.layout();
+    }
+
+    fn selectTab(self: *Frame, index: usize) void {
+        if (index >= self.tabs.items.len) return;
+        self.active = index;
+
+        for (self.tabs.items, 0..) |surface, i| {
+            _ = ShowWindow(surface.hwnd, if (i == index) SW_SHOW else SW_HIDE);
+        }
+
+        const active = self.tabs.items[index];
+        self.place(active);
+        _ = SetWindowPos(active.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        _ = SetFocus(active.hwnd);
+    }
+
+    fn place(self: *Frame, surface: *Surface) void {
+        const rect = self.contentRect();
+        _ = MoveWindow(
+            surface.hwnd,
+            rect.left,
+            rect.top,
+            @max(0, rect.right - rect.left),
+            @max(0, rect.bottom - rect.top),
+            1,
+        );
+    }
+
+    fn layout(self: *Frame) void {
+        var client: RECT = undefined;
+        if (GetClientRect(self.hwnd, &client) == 0) return;
+
+        _ = MoveWindow(self.tab_bar, 0, 0, client.right, tab_height, 1);
+
+        if (self.tabs.items.len > 0) self.place(self.tabs.items[self.active]);
+    }
+
+    fn removeSurface(self: *Frame, surface: *Surface) void {
+        var index: ?usize = null;
+        for (self.tabs.items, 0..) |item, i| {
+            if (item == surface) {
+                index = i;
+                break;
+            }
+        }
+        const i = index orelse return;
+
+        _ = SendMessageW(self.tab_bar, TCM_DELETEITEM, i, 0);
+        _ = self.tabs.orderedRemove(i);
+        surface.frame = null;
+
+        if (self.tabs.items.len == 0) {
+            _ = DestroyWindow(self.hwnd);
+            return;
+        }
+
+        if (self.active >= self.tabs.items.len) self.active = self.tabs.items.len - 1;
+        _ = SendMessageW(self.tab_bar, TCM_SETCURSEL, self.active, 0);
+        self.selectTab(self.active);
+    }
+
+    fn closeAll(self: *Frame) void {
+        // Ask the core to close each tab; every surface destroys its own
+        // window, and the last one destroys the frame.
+        for (self.tabs.items) |surface| surface.core_surface.close();
+    }
+};
+
+fn frameProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c) isize {
+    const frame = frameFromWindow(hwnd);
+    switch (msg) {
+        WM_SIZE, WM_MOVE => {
+            if (frame) |f| f.layout();
+            return 0;
+        },
+
+        WM_NOTIFY => {
+            if (frame) |f| {
+                const hdr: *NMHDR = @ptrFromInt(@as(usize, @bitCast(lParam)));
+                if (hdr.hwndFrom == f.tab_bar and hdr.code == TCN_SELCHANGE) {
+                    const sel = SendMessageW(f.tab_bar, TCM_GETCURSEL, 0, 0);
+                    if (sel >= 0) f.selectTab(@intCast(sel));
+                }
+            }
+            return 0;
+        },
+
+        WM_APP_IPC => {
+            // Process-wide messages go to the main window, which can be a
+            // frame rather than a terminal surface.
+            if (app_instance) |app| app.handleIpc(@intCast(wParam));
+            return 0;
+        },
+
+        WM_CLOSE => {
+            if (frame) |f| f.closeAll();
+            return 0;
+        },
+
+        WM_DESTROY => {
+            if (frame) |f| f.app.destroyFrame(f);
+            return 0;
+        },
+
+        WM_SETFOCUS => {
+            if (frame) |f| {
+                if (f.tabs.items.len > 0) _ = SetFocus(f.tabs.items[f.active].hwnd);
+            }
+            return 0;
+        },
+
+        else => {},
+    }
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+fn frameFromWindow(hwnd: HWND) ?*Frame {
+    const ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (ptr == 0) return null;
+    return @ptrFromInt(@as(usize, @bitCast(ptr)));
+}
+
 pub const Surface = struct {
     app: *App,
+
+    /// Host window this surface is a tab of, when it has one.
+    frame: ?*Frame = null,
     core_surface: CoreSurface,
     hwnd: HWND,
     size: apprt.SurfaceSize,
@@ -635,11 +985,19 @@ pub const Surface = struct {
     pub const Options = struct {
         working_directory: ?[]const u8 = null,
         font_size: f32 = 0,
+
+        /// When set, the surface is created as an owned popup window of
+        /// this window instead of as a standalone window. Tabs use this:
+        /// WGL presents reliably on top-level windows, but not on
+        /// `WS_CHILD` windows, so tab content is a real popup positioned
+        /// over the host window.
+        owner: ?HWND = null,
+
+        /// Screen rectangle for the popup, when `owner` is set.
+        rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
-        _ = opts;
-
         self.* = .{
             .app = app,
             .core_surface = undefined,
@@ -672,20 +1030,42 @@ pub const Surface = struct {
         const pos_x = @max(0, @divTrunc(GetSystemMetrics(0) - win_w, 2));
         const pos_y = @max(0, @divTrunc(GetSystemMetrics(1) - win_h, 2));
 
-        const hwnd = CreateWindowExW(
-            0,
-            class_name,
-            std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            pos_x,
-            pos_y,
-            win_w,
-            win_h,
-            null,
-            null,
-            hinstance,
-            self,
-        ) orelse return error.WindowCreateFailed;
+        const hwnd = if (opts.owner) |owner| popup: {
+            self.size = .{
+                .width = @intCast(@max(0, opts.rect.right - opts.rect.left)),
+                .height = @intCast(@max(0, opts.rect.bottom - opts.rect.top)),
+            };
+
+            break :popup CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                class_name,
+                std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
+                WS_POPUP | WS_VISIBLE,
+                opts.rect.left,
+                opts.rect.top,
+                @intCast(self.size.width),
+                @intCast(self.size.height),
+                owner,
+                null,
+                hinstance,
+                self,
+            ) orelse return error.WindowCreateFailed;
+        } else top: {
+            break :top CreateWindowExW(
+                0,
+                class_name,
+                std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                pos_x,
+                pos_y,
+                win_w,
+                win_h,
+                null,
+                null,
+                hinstance,
+                self,
+            ) orelse return error.WindowCreateFailed;
+        };
         errdefer _ = DestroyWindow(hwnd);
         self.hwnd = hwnd;
 

@@ -698,6 +698,8 @@ pub fn add(
             step.root_module.linkSystemLibrary("gdi32", .{});
             step.root_module.linkSystemLibrary("user32", .{});
             step.root_module.linkSystemLibrary("imm32", .{});
+            // The tab control lives in the common controls library.
+            step.root_module.linkSystemLibrary("comctl32", .{});
         }
 
         // Link EGL for GTK.
