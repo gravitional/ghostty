@@ -146,6 +146,8 @@ extern "user32" fn SetWindowPos(
 ) callconv(.c) BOOL;
 extern "user32" fn SetProcessDpiAwarenessContext(value: ?*anyopaque) callconv(.c) BOOL;
 extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.c) UINT;
+extern "user32" fn GetConsoleWindow() callconv(.c) ?HWND;
+extern "kernel32" fn GetConsoleProcessList(lpdwProcessList: [*]DWORD, dwProcessCount: DWORD) callconv(.c) DWORD;
 extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: LPCWSTR) callconv(.c) ?HCURSOR;
 extern "user32" fn AdjustWindowRectEx(lpRect: *RECT, dwStyle: DWORD, bMenu: BOOL, dwExStyle: DWORD) callconv(.c) BOOL;
 extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.c) BOOL;
@@ -211,6 +213,7 @@ const dpi_aware_v2: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -4)
 /// DPI that Windows considers 100% scaling.
 const base_dpi: f32 = 96;
 const SW_SHOW: c_int = 5;
+const SW_HIDE: c_int = 0;
 const GWLP_USERDATA: c_int = -21;
 const IDC_ARROW: LPCWSTR = @ptrFromInt(32512);
 const SRCCOPY: DWORD = 0x00CC_0020;
@@ -289,6 +292,8 @@ pub const App = struct {
     }
 
     pub fn run(self: *App) !void {
+        hideOwnedConsole();
+
         // Opt into per-monitor DPI scaling before any window exists so
         // that coordinates and fonts are in real device pixels. Without
         // this Windows bitmap-stretches the whole window.
@@ -848,6 +853,22 @@ fn surfaceFromWindow(hwnd: HWND) ?*Surface {
     const value = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if (value == 0) return null;
     return @ptrFromInt(@as(usize, @bitCast(value)));
+}
+
+/// Hide the console window when this process created it.
+///
+/// The executable currently links with the console subsystem so that
+/// Zig's `main` entry point works; a GUI launch from Explorer would
+/// otherwise leave a stray console next to the window. When the process
+/// was started from an existing terminal the console is shared (more than
+/// one attached process), so it is left alone and logs stay visible.
+fn hideOwnedConsole() void {
+    var pids: [2]DWORD = undefined;
+    if (GetConsoleProcessList(&pids, pids.len) != 1) return;
+
+    if (GetConsoleWindow()) |console| {
+        _ = ShowWindow(console, SW_HIDE);
+    }
 }
 
 /// The modifier state for the current input message.
