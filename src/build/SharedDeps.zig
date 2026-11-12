@@ -698,17 +698,6 @@ pub fn add(
             step.root_module.linkSystemLibrary("gdi32", .{});
             step.root_module.linkSystemLibrary("user32", .{});
             step.root_module.linkSystemLibrary("imm32", .{});
-
-            // The Win32 runtime presents through a D3D11 swap chain and
-            // falls back to GDI when the device cannot be created.
-            if (self.config.app_runtime == .win32) {
-                step.root_module.addCSourceFile(.{
-                    .file = b.path("src/apprt/win32/d3d11.c"),
-                    .flags = &.{},
-                });
-                step.root_module.linkSystemLibrary("d3d11", .{});
-                step.root_module.linkSystemLibrary("dxgi", .{});
-            }
         }
 
         // Link EGL for GTK.
