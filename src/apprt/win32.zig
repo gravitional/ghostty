@@ -548,13 +548,13 @@ pub const App = struct {
         const frame = try Frame.create(self);
         errdefer self.destroyFrame(frame);
 
-        // Show the frame before creating its first tab so the popup is
+        // Show the frame before creating its first pane so the popup is
         // positioned and visible from the moment GL starts presenting.
         _ = ShowWindow(frame.hwnd, SW_SHOW);
         _ = ShowWindow(frame.hwnd, SW_SHOW);
         _ = UpdateWindow(frame.hwnd);
 
-        _ = try self.createSurfaceIn(frame);
+        try self.addTab(frame);
 
         _ = SetForegroundWindow(frame.hwnd);
         _ = SetFocus(frame.hwnd);
@@ -569,8 +569,14 @@ pub const App = struct {
         return frame;
     }
 
-    /// Create a new tab in `frame` and focus it.
-    fn createSurfaceIn(self: *App, frame: *Frame) !*Surface {
+    /// Add a tab (with one pane) to `frame` and focus it.
+    fn addTab(self: *App, frame: *Frame) !void {
+        try frame.addTab();
+        _ = try self.createPane(frame, frame.tabs.items.len - 1);
+    }
+
+    /// Add a pane to an existing tab.
+    fn createPane(self: *App, frame: *Frame, tab_index: usize) !*Surface {
         const alloc = self.core_app.alloc;
 
         const surface = try alloc.create(Surface);
@@ -585,7 +591,11 @@ pub const App = struct {
         try self.surfaces.append(alloc, surface);
         errdefer _ = self.surfaces.pop();
 
-        try frame.addTab(surface);
+        try frame.tabs.items[tab_index].panes.append(alloc, surface);
+        surface.frame = frame;
+
+        frame.selectTab(tab_index);
+        frame.layoutTab(tab_index);
         return surface;
     }
 
@@ -633,6 +643,8 @@ pub const App = struct {
             }
         }
 
+        for (frame.tabs.items) |*tab| tab.panes.deinit(alloc);
+        frame.tabs.deinit(alloc);
         for (frame.titles.items) |title| alloc.free(title);
         frame.titles.deinit(alloc);
         alloc.destroy(frame);
@@ -653,7 +665,7 @@ pub const App = struct {
             .new_tab => {
                 if (self.frames.items.len > 0) {
                     const frame = self.frames.items[self.frames.items.len - 1];
-                    _ = self.createSurfaceIn(frame) catch |err| {
+                    self.addTab(frame) catch |err| {
                         log.err("failed to open tab for IPC err={}", .{err});
                     };
                 }
@@ -698,8 +710,22 @@ pub const App = struct {
                     else
                         null,
                 };
-                if (frame) |f| _ = try self.createSurfaceIn(f);
+                if (frame) |f| try self.addTab(f);
                 return frame != null;
+            },
+
+            .new_split => {
+                const surface: ?*Surface = switch (target) {
+                    .surface => |surface| surface.rt_surface,
+                    .app => null,
+                };
+                const frame = if (surface) |surf| surf.frame else null;
+                if (frame) |f| {
+                    const index = f.tabIndex(surface.?) orelse f.active;
+                    _ = try self.createPane(f, index);
+                    return true;
+                }
+                return false;
             },
 
             .set_title => {
@@ -727,17 +753,24 @@ pub const App = struct {
 // Surface
 // ---------------------------------------------------------------------------
 
+/// One tab: a set of panes laid out inside the frame's content area.
+pub const Tab = struct {
+    panes: std.ArrayListUnmanaged(*Surface) = .empty,
+    /// Focused pane.
+    active: usize = 0,
+};
+
 /// A window hosting one or more tabbed terminal surfaces.
 ///
 /// The frame owns the tab strip (drawn by us) and the popup windows that
-/// make up the tab contents. Tabs are top-level popups owned by the frame
+/// make up the tab contents. Panes are top-level popups owned by the frame
 /// rather than `WS_CHILD` windows because WGL only presents reliably on
 /// top-level windows.
 pub const Frame = struct {
     app: *App,
     hwnd: HWND,
     tab_bar: HWND,
-    tabs: std.ArrayListUnmanaged(*Surface) = .empty,
+    tabs: std.ArrayListUnmanaged(Tab) = .empty,
     /// Tab labels, UTF-16 so they can be drawn without conversion.
     titles: std.ArrayListUnmanaged([]u16) = .empty,
     active: usize = 0,
@@ -839,45 +872,81 @@ pub const Frame = struct {
         };
     }
 
-    fn addTab(self: *Frame, surface: *Surface) !void {
+    /// Append an empty tab and make it current.
+    fn addTab(self: *Frame) !void {
         const alloc = self.app.core_app.alloc;
         const label = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
-        const title = try alloc.dupe(u16, label[0..]);
 
-        const index = self.tabs.items.len;
-        try self.titles.append(alloc, title);
-        try self.tabs.append(alloc, surface);
+        try self.tabs.append(alloc, .{});
+        try self.titles.append(alloc, try alloc.dupe(u16, label[0..]));
 
-        surface.frame = self;
-        self.selectTab(index);
-        self.layout();
+        self.selectTab(self.tabs.items.len - 1);
+    }
+
+    /// The tab a surface belongs to, if any.
+    fn tabIndex(self: *Frame, surface: *Surface) ?usize {
+        for (self.tabs.items, 0..) |tab, i| {
+            for (tab.panes.items) |pane| {
+                if (pane == surface) return i;
+            }
+        }
+        return null;
     }
 
     fn selectTab(self: *Frame, index: usize) void {
         if (index >= self.tabs.items.len) return;
         self.active = index;
 
-        for (self.tabs.items, 0..) |surface, i| {
-            _ = ShowWindow(surface.hwnd, if (i == index) SW_SHOW else SW_HIDE);
+        for (self.tabs.items, 0..) |tab, ti| {
+            for (tab.panes.items) |pane| {
+                _ = ShowWindow(pane.hwnd, if (ti == index) SW_SHOW else SW_HIDE);
+            }
         }
 
-        const active = self.tabs.items[index];
-        self.place(active);
-        _ = SetWindowPos(active.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-        _ = SetFocus(active.hwnd);
+        self.layoutTab(index);
+
+        const tab = &self.tabs.items[index];
+        if (tab.panes.items.len > 0) {
+            const active = tab.panes.items[tab.active];
+            _ = SetWindowPos(active.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            _ = SetFocus(active.hwnd);
+        }
+
         _ = InvalidateRect(self.tab_bar, null, 1);
     }
 
-    fn place(self: *Frame, surface: *Surface) void {
+    /// Lay the panes of one tab out inside the content rectangle.
+    fn layoutTab(self: *Frame, index: usize) void {
+        if (index >= self.tabs.items.len) return;
         const rect = self.contentRect();
-        _ = MoveWindow(
-            surface.hwnd,
-            rect.left,
-            rect.top,
-            @max(0, rect.right - rect.left),
-            @max(0, rect.bottom - rect.top),
-            1,
-        );
+
+        const panes = self.tabs.items[index].panes.items;
+        const n = panes.len;
+        if (n == 0) return;
+
+        if (n == 1) {
+            placePane(panes[0], rect);
+            return;
+        }
+
+        // Simple layout: panes are stacked in a row of columns, two per
+        // row. A split tree is a later step.
+        const cols: i32 = if (n == 2) 2 else if (n <= 4) 2 else 3;
+        const rows: i32 = @intCast(@divTrunc(@as(usize, n) + @as(usize, @intCast(cols)) - 1, @as(usize, @intCast(cols))));
+
+        const width = @divTrunc(rect.right - rect.left, cols);
+        const height = @divTrunc(rect.bottom - rect.top, rows);
+
+        for (panes, 0..) |pane, i| {
+            const col: i32 = @intCast(i % @as(usize, @intCast(cols)));
+            const row: i32 = @intCast(@divTrunc(i, @as(usize, @intCast(cols))));
+            placePane(pane, .{
+                .left = rect.left + col * width,
+                .top = rect.top + row * height,
+                .right = if (col == cols - 1) rect.right else rect.left + (col + 1) * width,
+                .bottom = if (row == rows - 1) rect.bottom else rect.top + (row + 1) * height,
+            });
+        }
     }
 
     fn layout(self: *Frame) void {
@@ -885,41 +954,47 @@ pub const Frame = struct {
         if (GetClientRect(self.hwnd, &client) == 0) return;
 
         _ = MoveWindow(self.tab_bar, 0, 0, client.right, tab_height, 1);
-
-        if (self.tabs.items.len > 0) self.place(self.tabs.items[self.active]);
+        self.layoutTab(self.active);
     }
 
     fn removeSurface(self: *Frame, surface: *Surface) void {
-        var index: ?usize = null;
-        for (self.tabs.items, 0..) |item, i| {
-            if (item == surface) {
-                index = i;
-                break;
+        const alloc = self.app.core_app.alloc;
+
+        for (self.tabs.items, 0..) |*tab, ti| {
+            for (tab.panes.items, 0..) |pane, pi| {
+                if (pane != surface) continue;
+
+                _ = tab.panes.orderedRemove(pi);
+                surface.frame = null;
+
+                if (tab.panes.items.len == 0) {
+                    _ = self.tabs.orderedRemove(ti);
+                    if (ti < self.titles.items.len) alloc.free(self.titles.orderedRemove(ti));
+
+                    if (self.tabs.items.len == 0) {
+                        _ = DestroyWindow(self.hwnd);
+                        return;
+                    }
+
+                    if (self.active >= self.tabs.items.len) self.active = self.tabs.items.len - 1;
+                    self.selectTab(self.active);
+                } else {
+                    if (tab.active >= tab.panes.items.len) tab.active = tab.panes.items.len - 1;
+                    self.layoutTab(ti);
+                }
+
+                _ = InvalidateRect(self.tab_bar, null, 1);
+                return;
             }
         }
-        const i = index orelse return;
-
-        const alloc = self.app.core_app.alloc;
-        if (i < self.titles.items.len) {
-            alloc.free(self.titles.orderedRemove(i));
-        }
-        _ = self.tabs.orderedRemove(i);
-        surface.frame = null;
-
-        if (self.tabs.items.len == 0) {
-            _ = DestroyWindow(self.hwnd);
-            return;
-        }
-
-        if (self.active >= self.tabs.items.len) self.active = self.tabs.items.len - 1;
-        self.selectTab(self.active);
-        _ = InvalidateRect(self.tab_bar, null, 1);
     }
 
     fn closeAll(self: *Frame) void {
-        // Ask the core to close each tab; every surface destroys its own
-        // window, and the last one destroys the frame.
-        for (self.tabs.items) |surface| surface.core_surface.close();
+        // Ask the core to close each pane; a surface destroys its own
+        // window as it goes, and the last one destroys the frame.
+        for (self.tabs.items) |tab| {
+            for (tab.panes.items) |pane| pane.core_surface.close();
+        }
     }
 };
 
@@ -932,8 +1007,6 @@ fn frameProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c)
         },
 
         WM_APP_IPC => {
-            // Process-wide messages go to the main window, which can be a
-            // frame rather than a terminal surface.
             if (app_instance) |app| app.handleIpc(@intCast(wParam));
             return 0;
         },
@@ -950,7 +1023,8 @@ fn frameProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c)
 
         WM_SETFOCUS => {
             if (frame) |f| {
-                if (f.tabs.items.len > 0) _ = SetFocus(f.tabs.items[f.active].hwnd);
+                const tab = &f.tabs.items[f.active];
+                if (tab.panes.items.len > 0) _ = SetFocus(tab.panes.items[tab.active].hwnd);
             }
             return 0;
         },
@@ -1032,6 +1106,17 @@ fn paintTabBar(frame: *Frame, hwnd: HWND) void {
             0x1 | 0x4 | 0x20, // CENTER | VCENTER | SINGLELINE
         );
     }
+}
+
+fn placePane(surface: *Surface, rect: RECT) void {
+    _ = MoveWindow(
+        surface.hwnd,
+        rect.left,
+        rect.top,
+        @max(0, rect.right - rect.left),
+        @max(0, rect.bottom - rect.top),
+        1,
+    );
 }
 
 fn frameFromWindow(hwnd: HWND) ?*Frame {
