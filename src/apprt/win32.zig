@@ -1169,6 +1169,17 @@ fn frameProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c)
             return 0;
         },
 
+        WM_APP_WAKEUP => {
+            // The core posts wakeups to the process-wide window, which is a
+            // frame; without this the render threads never wake up.
+            if (app_instance) |app| {
+                app.core_app.tick(app) catch |err| {
+                    log.err("core tick failed err={}", .{err});
+                };
+            }
+            return 0;
+        },
+
         WM_CLOSE => {
             if (frame) |f| f.closeAll();
             return 0;
