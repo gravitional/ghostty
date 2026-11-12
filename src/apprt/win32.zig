@@ -457,6 +457,13 @@ pub const App = struct {
     /// released when the app shuts down.
     retired_configs: std.ArrayListUnmanaged(Config) = .empty,
 
+    /// Surfaces whose window is gone. The core may still hold references to
+    /// them while it tears its own state down and while it runs callbacks
+    /// from other threads, so the memory is only released at shutdown.
+    /// Freeing it here crashed the process as soon as another window was
+    /// created after closing a pane.
+    retired_surfaces: std.ArrayListUnmanaged(*Surface) = .empty,
+
     pub const Options = struct {};
 
     /// There is no cross-process IPC channel on Windows yet, so CLI
@@ -680,7 +687,11 @@ pub const App = struct {
         if (surface.working_directory) |dir| alloc.free(dir);
         if (surface.pixels.len > 0) alloc.free(surface.pixels);
         if (surface.title) |title| alloc.free(title);
-        alloc.destroy(surface);
+
+        self.retired_surfaces.append(alloc, surface) catch {
+            // Nothing else to do: leaking the surface is better than freeing
+            // memory the core might still reference.
+        };
     }
 
     /// Release a frame after its window has been destroyed.
