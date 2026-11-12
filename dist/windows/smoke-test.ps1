@@ -368,6 +368,27 @@ try {
     $afterHash = (Get-FileHash $after -Algorithm SHA256).Hash
     Check 'paste: screen changes' ($beforeHash -ne $afterHash)
 
+    # Ending the shell has to end the process: the window and the message
+    # loop go away together. This runs last because it kills the instance.
+    # Two windows are open by now, each with its own shell, so every shell
+    # has to end before the process may.
+    for ($round = 0; $round -lt 4; $round++) {
+        $shells = [GhosttySmoke]::ByClass($pid0, 'GhosttyWin32')
+        if ($shells.Count -eq 0) { break }
+        [GhosttySmoke]::Type($shells[0], 'exit')
+        [GhosttySmoke]::Key($shells[0], 0x0D)
+        Start-Sleep -Seconds 2
+    }
+    $exited = $false
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (-not (Get-Process -Id $pid0 -ErrorAction SilentlyContinue)) { $exited = $true; break }
+        Start-Sleep -Milliseconds 200
+    }
+    $left = ([GhosttySmoke]::ByClass($pid0, 'GhosttyFrame')).Count
+    $leftPanes = ([GhosttySmoke]::ByClass($pid0, 'GhosttyWin32')).Count
+    Check 'shell exit: the process exits' $exited "frames=$left panes=$leftPanes"
+
 
 }
 finally {
