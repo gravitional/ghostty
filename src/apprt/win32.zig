@@ -55,6 +55,15 @@ const WNDPROC = *const fn (HWND, UINT, WPARAM, LPARAM) callconv(.c) LRESULT;
 
 const POINT = extern struct { x: i32, y: i32 };
 const RECT = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
+const PAINTSTRUCT = extern struct {
+    hdc: ?HDC,
+    fErase: BOOL,
+    rcPaint: RECT,
+    fRestore: BOOL,
+    fIncUpdate: BOOL,
+    rgbReserved: [32]u8,
+};
+
 const MSG = extern struct {
     hwnd: ?HWND = null,
     message: UINT = 0,
@@ -163,6 +172,8 @@ const TCS_FOCUSNEVER: DWORD = 0x0001;
 const TCM_INSERTITEMW: UINT = 0x1307;
 const TCM_DELETEITEM: UINT = 0x1308;
 const TCM_GETCOUNT: UINT = 0x1304;
+const TCM_GETITEMW: UINT = 0x1305;
+const TCM_SETITEMW: UINT = 0x1306;
 const TCM_GETCURSEL: UINT = 0x130B;
 const TCM_SETCURSEL: UINT = 0x130C;
 const TCM_SETITEMSIZE: UINT = 0x1329;
@@ -282,6 +293,18 @@ extern "gdi32" fn StretchDIBits(
     iUsage: UINT,
     rop: DWORD,
 ) callconv(.c) c_int;
+
+extern "gdi32" fn GetStockObject(i: c_int) callconv(.c) ?HANDLE;
+extern "gdi32" fn SelectObject(hdc: HDC, h: ?HANDLE) callconv(.c) ?HANDLE;
+extern "gdi32" fn DeleteObject(h: ?HANDLE) callconv(.c) BOOL;
+extern "gdi32" fn SetBkMode(hdc: HDC, mode: c_int) callconv(.c) c_int;
+extern "gdi32" fn SetTextColor(hdc: HDC, color: DWORD) callconv(.c) DWORD;
+extern "gdi32" fn CreateSolidBrush(color: DWORD) callconv(.c) ?HANDLE;
+extern "user32" fn FillRect(hdc: HDC, rect: *const RECT, brush: ?HANDLE) callconv(.c) c_int;
+extern "user32" fn GetSysColor(index: c_int) callconv(.c) DWORD;
+extern "user32" fn DrawTextW(hdc: HDC, text: [*]const u16, len: c_int, rect: *RECT, flags: UINT) callconv(.c) c_int;
+extern "user32" fn BeginPaint(hwnd: HWND, ps: *PAINTSTRUCT) callconv(.c) ?HDC;
+extern "user32" fn EndPaint(hwnd: HWND, ps: *const PAINTSTRUCT) callconv(.c) BOOL;
 
 extern "gdi32" fn PatBlt(hdc: HDC, x: c_int, y: c_int, w: c_int, h: c_int, rop: DWORD) callconv(.c) BOOL;
 
@@ -610,6 +633,8 @@ pub const App = struct {
             }
         }
 
+        for (frame.titles.items) |title| alloc.free(title);
+        frame.titles.deinit(alloc);
         alloc.destroy(frame);
     }
 
@@ -704,21 +729,23 @@ pub const App = struct {
 
 /// A window hosting one or more tabbed terminal surfaces.
 ///
-/// The frame owns the native tab control and the popup windows that make up
-/// the tab contents. Tabs are top-level popups owned by the frame rather
-/// than `WS_CHILD` windows because WGL only presents reliably on top-level
-/// windows.
+/// The frame owns the tab strip (drawn by us) and the popup windows that
+/// make up the tab contents. Tabs are top-level popups owned by the frame
+/// rather than `WS_CHILD` windows because WGL only presents reliably on
+/// top-level windows.
 pub const Frame = struct {
     app: *App,
     hwnd: HWND,
     tab_bar: HWND,
     tabs: std.ArrayListUnmanaged(*Surface) = .empty,
+    /// Tab labels, UTF-16 so they can be drawn without conversion.
+    titles: std.ArrayListUnmanaged([]u16) = .empty,
     active: usize = 0,
 
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyFrame");
-    const tab_class = std.unicode.utf8ToUtf16LeStringLiteral("SysTabControl32");
-    const tab_id: usize = 1;
+    const tab_class = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyTabBar");
     const tab_height: i32 = 28;
+    const tab_width: i32 = 170;
 
     fn create(app: *App) !*Frame {
         const alloc = app.core_app.alloc;
@@ -731,6 +758,14 @@ pub const Frame = struct {
             .lpszClassName = class_name,
         };
         _ = RegisterClassExW(&wc);
+
+        var tab_wc: WNDCLASSEXW = .{
+            .lpfnWndProc = tabBarProc,
+            .hInstance = hinstance,
+            .hCursor = LoadCursorW(null, IDC_ARROW),
+            .lpszClassName = tab_class,
+        };
+        _ = RegisterClassExW(&tab_wc);
 
         const self = alloc.create(Frame) catch return error.OutOfMemory;
         errdefer alloc.destroy(self);
@@ -764,34 +799,21 @@ pub const Frame = struct {
         ) orelse return error.WindowCreateFailed;
         _ = SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
-        var icc: INITCOMMONCONTROLSEX = .{
-            .dwSize = @sizeOf(INITCOMMONCONTROLSEX),
-            .dwICC = ICC_TAB_CLASSES,
-        };
-        _ = InitCommonControlsEx(&icc);
-
         self.tab_bar = CreateWindowExW(
             0,
             tab_class,
             std.unicode.utf8ToUtf16LeStringLiteral(""),
-            WS_CHILD | WS_VISIBLE | TCS_FOCUSNEVER,
+            WS_CHILD | WS_VISIBLE,
             0,
             0,
-            100,
+            win_w,
             tab_height,
             self.hwnd,
-            @ptrFromInt(tab_id),
-            hinstance,
             null,
+            hinstance,
+            self,
         ) orelse return error.WindowCreateFailed;
-
-        // Wide enough for a decent title, and one line high.
-        _ = SendMessageW(
-            self.tab_bar,
-            TCM_SETITEMSIZE,
-            0,
-            @intCast((@as(isize, 22) << 16) | @as(isize, 160)),
-        );
+        _ = SetWindowLongPtrW(self.tab_bar, GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
         try app.frames.append(alloc, self);
         return self;
@@ -818,16 +840,13 @@ pub const Frame = struct {
     }
 
     fn addTab(self: *Frame, surface: *Surface) !void {
-        const title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
-        var item: TCITEMW = .{
-            .mask = TCIF_TEXT,
-            .pszText = @constCast(title.ptr),
-            .cchTextMax = @intCast(title.len),
-        };
+        const alloc = self.app.core_app.alloc;
+        const label = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+        const title = try alloc.dupe(u16, label[0..]);
 
         const index = self.tabs.items.len;
-        _ = SendMessageW(self.tab_bar, TCM_INSERTITEMW, index, @intCast(@intFromPtr(&item)));
-        try self.tabs.append(self.app.core_app.alloc, surface);
+        try self.titles.append(alloc, title);
+        try self.tabs.append(alloc, surface);
 
         surface.frame = self;
         self.selectTab(index);
@@ -846,6 +865,7 @@ pub const Frame = struct {
         self.place(active);
         _ = SetWindowPos(active.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         _ = SetFocus(active.hwnd);
+        _ = InvalidateRect(self.tab_bar, null, 1);
     }
 
     fn place(self: *Frame, surface: *Surface) void {
@@ -879,7 +899,10 @@ pub const Frame = struct {
         }
         const i = index orelse return;
 
-        _ = SendMessageW(self.tab_bar, TCM_DELETEITEM, i, 0);
+        const alloc = self.app.core_app.alloc;
+        if (i < self.titles.items.len) {
+            alloc.free(self.titles.orderedRemove(i));
+        }
         _ = self.tabs.orderedRemove(i);
         surface.frame = null;
 
@@ -889,8 +912,8 @@ pub const Frame = struct {
         }
 
         if (self.active >= self.tabs.items.len) self.active = self.tabs.items.len - 1;
-        _ = SendMessageW(self.tab_bar, TCM_SETCURSEL, self.active, 0);
         self.selectTab(self.active);
+        _ = InvalidateRect(self.tab_bar, null, 1);
     }
 
     fn closeAll(self: *Frame) void {
@@ -905,17 +928,6 @@ fn frameProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c)
     switch (msg) {
         WM_SIZE, WM_MOVE => {
             if (frame) |f| f.layout();
-            return 0;
-        },
-
-        WM_NOTIFY => {
-            if (frame) |f| {
-                const hdr: *NMHDR = @ptrFromInt(@as(usize, @bitCast(lParam)));
-                if (hdr.hwndFrom == f.tab_bar and hdr.code == TCN_SELCHANGE) {
-                    const sel = SendMessageW(f.tab_bar, TCM_GETCURSEL, 0, 0);
-                    if (sel >= 0) f.selectTab(@intCast(sel));
-                }
-            }
             return 0;
         },
 
@@ -947,6 +959,79 @@ fn frameProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c)
     }
 
     return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+/// Draws the tab strip and switches tabs on click.
+fn tabBarProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c) isize {
+    const frame = frameFromWindow(hwnd) orelse
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+
+    switch (msg) {
+        WM_ERASEBKGND => return 1,
+
+        WM_PAINT => {
+            paintTabBar(frame, hwnd);
+            return 0;
+        },
+
+        WM_LBUTTONDOWN => {
+            const x: i32 = @intCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
+            const index = @divTrunc(x, Frame.tab_width);
+            if (index >= 0 and index < frame.tabs.items.len) {
+                frame.selectTab(@intCast(index));
+            }
+            return 0;
+        },
+
+        else => {},
+    }
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+fn paintTabBar(frame: *Frame, hwnd: HWND) void {
+    var ps: PAINTSTRUCT = undefined;
+    const dc = BeginPaint(hwnd, &ps) orelse return;
+    defer _ = EndPaint(hwnd, &ps);
+
+    var client: RECT = undefined;
+    if (GetClientRect(hwnd, &client) == 0) return;
+
+    const bg = GetSysColor(15); // COLOR_BTNFACE
+    if (CreateSolidBrush(bg)) |brush| {
+        _ = FillRect(dc, &client, brush);
+        _ = DeleteObject(brush);
+    }
+
+    const font = GetStockObject(17); // DEFAULT_GUI_FONT
+    const old_font = SelectObject(dc, font);
+    defer _ = SelectObject(dc, old_font);
+    _ = SetBkMode(dc, 1); // TRANSPARENT
+
+    for (frame.titles.items, 0..) |title, i| {
+        var rect: RECT = .{
+            .left = @as(i32, @intCast(i)) * Frame.tab_width,
+            .top = 0,
+            .right = @as(i32, @intCast(i + 1)) * Frame.tab_width,
+            .bottom = client.bottom,
+        };
+
+        if (i == frame.active) {
+            if (CreateSolidBrush(GetSysColor(5))) |brush| { // COLOR_WINDOW
+                _ = FillRect(dc, &rect, brush);
+                _ = DeleteObject(brush);
+            }
+        }
+
+        _ = SetTextColor(dc, GetSysColor(18)); // COLOR_BTNTEXT
+        _ = DrawTextW(
+            dc,
+            title.ptr,
+            @intCast(title.len),
+            &rect,
+            0x1 | 0x4 | 0x20, // CENTER | VCENTER | SINGLELINE
+        );
+    }
 }
 
 fn frameFromWindow(hwnd: HWND) ?*Frame {
