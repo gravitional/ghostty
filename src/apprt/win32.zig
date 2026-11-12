@@ -148,6 +148,8 @@ extern "user32" fn SetProcessDpiAwarenessContext(value: ?*anyopaque) callconv(.c
 extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.c) UINT;
 extern "user32" fn GetConsoleWindow() callconv(.c) ?HWND;
 extern "kernel32" fn GetConsoleProcessList(lpdwProcessList: [*]DWORD, dwProcessCount: DWORD) callconv(.c) DWORD;
+extern "user32" fn SetCapture(hWnd: HWND) callconv(.c) ?HWND;
+extern "user32" fn ReleaseCapture() callconv(.c) BOOL;
 extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: LPCWSTR) callconv(.c) ?HCURSOR;
 extern "user32" fn AdjustWindowRectEx(lpRect: *RECT, dwStyle: DWORD, bMenu: BOOL, dwExStyle: DWORD) callconv(.c) BOOL;
 extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.c) BOOL;
@@ -195,6 +197,16 @@ const WM_DPICHANGED: UINT = 0x02E0;
 const WM_KEYDOWN: UINT = 0x0100;
 const WM_KEYUP: UINT = 0x0101;
 const WM_CHAR: UINT = 0x0102;
+const WM_MOUSEMOVE: UINT = 0x0200;
+const WM_LBUTTONDOWN: UINT = 0x0201;
+const WM_LBUTTONUP: UINT = 0x0202;
+const WM_RBUTTONDOWN: UINT = 0x0204;
+const WM_RBUTTONUP: UINT = 0x0205;
+const WM_MBUTTONDOWN: UINT = 0x0207;
+const WM_MBUTTONUP: UINT = 0x0208;
+const WM_MOUSEWHEEL: UINT = 0x020A;
+const WM_XBUTTONDOWN: UINT = 0x020B;
+const WM_XBUTTONUP: UINT = 0x020C;
 const WM_SYSKEYDOWN: UINT = 0x0104;
 const WM_SYSKEYUP: UINT = 0x0105;
 const WM_SYSCHAR: UINT = 0x0106;
@@ -640,6 +652,43 @@ pub const Surface = struct {
         return effect == .consumed;
     }
 
+    /// Report a mouse move to the core. Coordinates are already device
+    /// pixels because the window is per-monitor DPI aware.
+    pub fn cursorPosCallback(self: *Surface, x: f64, y: f64) void {
+        const pos: apprt.CursorPos = .{
+            .x = @floatCast(x),
+            .y = @floatCast(y),
+        };
+
+        // Platforms sometimes deliver a move to the same position (for
+        // example when the title changes); ignore those so that
+        // mouse-hide-while-typing does not flicker.
+        if (@abs(self.cursor_pos.x - pos.x) < 1 and
+            @abs(self.cursor_pos.y - pos.y) < 1) return;
+
+        self.cursor_pos = pos;
+        self.core_surface.cursorPosCallback(pos, currentMods()) catch |err| {
+            log.err("error in cursor pos callback err={}", .{err});
+        };
+    }
+
+    pub fn mouseButtonCallback(
+        self: *Surface,
+        state: input.MouseButtonState,
+        button: input.MouseButton,
+    ) void {
+        _ = self.core_surface.mouseButtonCallback(state, button, currentMods()) catch |err| {
+            log.err("error in mouse button callback err={}", .{err});
+            return;
+        };
+    }
+
+    pub fn scrollCallback(self: *Surface, xoff: f64, yoff: f64) void {
+        self.core_surface.scrollCallback(xoff, yoff, .{}) catch |err| {
+            log.err("error in scroll callback err={}", .{err});
+        };
+    }
+
     /// Pull the latest exported frame and blit it into the window.
     fn presentFrame(self: *Surface) void {
         const frame = self.core_surface.renderer.takeFrame() orelse {
@@ -737,6 +786,38 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
             const width: u32 = @as(u16, @truncate(@as(usize, @bitCast(lParam))));
             const height: u32 = @intCast((@as(usize, @bitCast(lParam)) >> 16) & 0xFFFF);
             self.updateSize(width, height);
+            return 0;
+        },
+
+        WM_MOUSEMOVE => {
+            const p = mousePos(lParam);
+            self.cursorPosCallback(p.x, p.y);
+            return 0;
+        },
+
+        WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_XBUTTONDOWN => {
+            const p = mousePos(lParam);
+            self.cursorPosCallback(p.x, p.y);
+            _ = SetCapture(hwnd);
+            self.mouseButtonCallback(.press, buttonFromMsg(msg, wParam));
+            return 0;
+        },
+
+        WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP, WM_XBUTTONUP => {
+            const p = mousePos(lParam);
+            self.cursorPosCallback(p.x, p.y);
+            _ = ReleaseCapture();
+            self.mouseButtonCallback(.release, buttonFromMsg(msg, wParam));
+            return 0;
+        },
+
+        WM_MOUSEWHEEL => {
+            // The high word of wParam is a signed delta in multiples of
+            // 120; one notch is one line, and the core applies the user's
+            // scroll multiplier on top.
+            const raw: i16 = @bitCast(@as(u16, @truncate((wParam >> 16) & 0xFFFF)));
+            const yoff = @as(f64, @floatFromInt(raw)) / 120.0;
+            self.scrollCallback(0, yoff);
             return 0;
         },
 
@@ -853,6 +934,29 @@ fn surfaceFromWindow(hwnd: HWND) ?*Surface {
     const value = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if (value == 0) return null;
     return @ptrFromInt(@as(usize, @bitCast(value)));
+}
+
+/// Cursor position, in device pixels, from a mouse message's lParam.
+fn mousePos(lParam: LPARAM) struct { x: f64, y: f64 } {
+    const value: usize = @bitCast(lParam);
+    const x: i16 = @bitCast(@as(u16, @truncate(value & 0xFFFF)));
+    const y: i16 = @bitCast(@as(u16, @truncate((value >> 16) & 0xFFFF)));
+    return .{ .x = @floatFromInt(x), .y = @floatFromInt(y) };
+}
+
+/// Map a button message to the core's button enum. Side buttons map to
+/// the extra buttons terminal mouse reporting tracks.
+fn buttonFromMsg(msg: UINT, wParam: WPARAM) input.MouseButton {
+    return switch (msg) {
+        WM_LBUTTONDOWN, WM_LBUTTONUP => .left,
+        WM_RBUTTONDOWN, WM_RBUTTONUP => .right,
+        WM_MBUTTONDOWN, WM_MBUTTONUP => .middle,
+        else => switch (@as(u16, @truncate((wParam >> 16) & 0xFFFF))) {
+            1 => .four,
+            2 => .five,
+            else => .unknown,
+        },
+    };
 }
 
 /// Hide the console window when this process created it.
