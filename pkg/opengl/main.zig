@@ -12,7 +12,23 @@
 //! comptime help. I'm deferring this until later but have some fun ideas.
 pub const c = @import("opengl_c");
 pub const glad = @import("glad.zig");
-pub const egl = @import("egl.zig");
+
+const builtin = @import("builtin");
+
+/// Window-system integration for creating GPU contexts.
+///
+/// EGL is used on Unix; Windows has no EGL, so a small WGL implementation
+/// exposes the same interface there. Both provide `Display`, `Config`,
+/// `Context` and the helpers below.
+pub const wsi = if (builtin.target.os.tag == .windows)
+    @import("wgl.zig")
+else
+    @import("egl.zig");
+
+/// EGL is only available on non-Windows targets. Code that needs raw EGL
+/// (DMABUF export, platform display selection) must be comptime-gated.
+pub const egl = if (builtin.target.os.tag == .windows) struct {} else @import("egl.zig");
+
 pub const ext = @import("extensions.zig");
 pub const Buffer = @import("Buffer.zig");
 pub const Framebuffer = @import("Framebuffer.zig");

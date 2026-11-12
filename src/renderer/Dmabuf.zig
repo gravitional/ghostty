@@ -9,6 +9,26 @@
 //! implementations.
 pub const Dmabuf = @This();
 pub const std = @import("std");
+const builtin = @import("builtin");
+
+/// DMABUF export is a Linux-only feature. Windows has no POSIX file
+/// descriptors (`std.posix.fd_t` is an opaque handle there), so we use a
+/// plain `i32` placeholder that is always invalid and never closed. This
+/// keeps the shared renderer types representable on Windows while the
+/// Linux-only export path stays comptime-excluded.
+const is_windows = builtin.target.os.tag == .windows;
+const fd_t = if (is_windows) i32 else std.posix.fd_t;
+
+/// Pick the implementation at comptime so the other one is never analyzed.
+const closeFd = if (is_windows) closeFdWindows else closeFdPosix;
+
+fn closeFdWindows(fd: fd_t) void {
+    _ = fd;
+}
+
+fn closeFdPosix(fd: fd_t) void {
+    if (fd >= 0) _ = std.posix.system.close(fd);
+}
 
 /// The maximum number of planes in a DMABUF that we support.
 /// This matches the maximum found in apprts such as GTK.
@@ -41,7 +61,7 @@ pub const Planes = struct {
     count: u8,
 
     /// File descriptor for each plane.
-    fds: [max_planes]std.posix.fd_t = @splat(-1),
+    fds: [max_planes]fd_t = @splat(-1),
 
     /// Offset into the DMABUF where each plane starts, in bytes.
     offsets: [max_planes]c_int = @splat(0),
@@ -51,9 +71,7 @@ pub const Planes = struct {
 
     /// Close all valid fds.
     pub fn deinit(self: Planes) void {
-        for (self.fds[0..self.count]) |fd| {
-            if (fd >= 0) _ = std.posix.system.close(fd);
-        }
+        for (self.fds[0..self.count]) |fd| closeFd(fd);
     }
 
     /// Validate the current planes. If any plane failed to export
@@ -63,7 +81,7 @@ pub const Planes = struct {
         var n_valid: usize = 0;
         while (n_valid < self.count) : (n_valid += 1) {
             if (self.fds[n_valid] < 0) {
-                for (self.fds[0..n_valid]) |bad| _ = std.posix.system.close(bad);
+                for (self.fds[0..n_valid]) |bad| closeFd(bad);
                 return error.BadDmabuf;
             }
         }

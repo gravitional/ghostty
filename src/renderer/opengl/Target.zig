@@ -22,7 +22,8 @@ const Self = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const gl = @import("opengl");
-const egl = gl.egl;
+const wsi = gl.wsi;
+const builtin = @import("builtin");
 const Dmabuf = @import("../Dmabuf.zig");
 
 const log = std.log.scoped(.opengl);
@@ -145,11 +146,30 @@ pub fn deinit(self: *Self) void {
     self.export_texture.destroy();
 }
 
-pub fn exportDmabuf(
+/// DMABUF export only exists on systems with EGL. Everywhere else the
+/// renderer falls back to CPU readback, so this always fails there.
+pub const exportDmabuf = if (builtin.target.os.tag == .windows)
+    exportDmabufUnsupported
+else
+    exportDmabufEgl;
+
+fn exportDmabufUnsupported(
     self: *const Self,
-    display: *egl.Display,
-    context: *egl.Context,
+    display: *wsi.Display,
+    context: *wsi.Context,
 ) !Dmabuf {
+    _ = self;
+    _ = display;
+    _ = context;
+    return error.DmabufUnsupported;
+}
+
+fn exportDmabufEgl(
+    self: *const Self,
+    display: *wsi.Display,
+    context: *wsi.Context,
+) !Dmabuf {
+    const egl = gl.egl;
     // We disable GL_FRAMEBUFFER_SRGB while doing this blit, otherwise
     // the values may be linearized as they're copied, but even though
     // the draw framebuffer has a linear internal format, the values in

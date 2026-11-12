@@ -9,15 +9,28 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
-    try translate_c.addImportToModule(b, "opengl_c", module, .{
-        .source = .{ .includes = .{
-            .files = &.{
+
+    // Windows has no EGL. Translating `glad_egl.h` there would declare EGL
+    // globals that nothing defines, which fails the Windows linker, so only
+    // the GL header is translated for that target.
+    switch (target.result.os.tag) {
+        .windows => try translate_c.addImportToModule(b, "opengl_c", module, .{
+            .source = .{ .includes = .{ .files = &.{
+                .{ .path = "glad/gl.h" },
+            } } },
+            .target = target,
+            .optimize = optimize,
+            .include_paths = &.{b.path("../../vendor/glad/include")},
+        }),
+
+        else => try translate_c.addImportToModule(b, "opengl_c", module, .{
+            .source = .{ .includes = .{ .files = &.{
                 .{ .path = "glad/gl.h" },
                 .{ .path = "glad/glad_egl.h" },
-            },
-        } },
-        .target = target,
-        .optimize = optimize,
-        .include_paths = &.{b.path("../../vendor/glad/include")},
-    });
+            } } },
+            .target = target,
+            .optimize = optimize,
+            .include_paths = &.{b.path("../../vendor/glad/include")},
+        }),
+    }
 }

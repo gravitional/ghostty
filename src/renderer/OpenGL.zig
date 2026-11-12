@@ -4,7 +4,8 @@ pub const OpenGL = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const gl = @import("opengl");
-const egl = gl.egl;
+const wsi = gl.wsi;
+const builtin = @import("builtin");
 const shadertoy = @import("shadertoy.zig");
 const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
@@ -47,7 +48,7 @@ blending: configpkg.Config.AlphaBlending,
 /// The shared render device.
 device: *const Device,
 
-egl_context: *gl.egl.Context,
+wsi_context: *wsi.Context,
 
 pub fn init(
     alloc: Allocator,
@@ -56,24 +57,16 @@ pub fn init(
 ) !OpenGL {
     const display = device.display;
 
-    // Bind to OpenGL API explicitly before we create the context,
-    // as otherwise it might fallback to OpenGL ES
-    try egl.bindApi(egl.c.EGL_OPENGL_API);
-
     // Create our context. Contexts are surface-scoped because a
     // context can only be current on one thread at a time.
-    const context = egl.Context.create(display, device.config, null, &.{
-        egl.c.EGL_CONTEXT_MAJOR_VERSION,       MIN_VERSION_MAJOR,
-        egl.c.EGL_CONTEXT_MINOR_VERSION,       MIN_VERSION_MINOR,
-        egl.c.EGL_CONTEXT_OPENGL_PROFILE_MASK, egl.c.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
-    }) catch |err| {
-        log.warn("failed to create EGL context err={}", .{err});
+    const context = wsi.Context.createDefault(display, device.config) catch |err| {
+        log.warn("failed to create GL context err={}", .{err});
         return err;
     };
     errdefer context.destroy(display) catch {};
 
     display.makeCurrent(null, null, context) catch |err| {
-        log.warn("failed to make EGL context current err={}", .{err});
+        log.warn("failed to make GL context current err={}", .{err});
         return err;
     };
 
@@ -85,13 +78,13 @@ pub fn init(
         .alloc = alloc,
         .blending = opts.config.blending,
         .device = device,
-        .egl_context = context,
+        .wsi_context = context,
     };
 }
 
 pub fn deinit(self: *OpenGL) void {
     self.device.display.releaseCurrent();
-    self.egl_context.destroy(self.device.display) catch {};
+    self.wsi_context.destroy(self.device.display) catch {};
     self.* = undefined;
 }
 
@@ -200,9 +193,9 @@ fn prepareContext(getProcAddress: anytype) !void {
 /// function pointers so all subsequent GL work on this thread is valid.
 pub fn threadEnter(self: *OpenGL, surface: *apprt.Surface) !void {
     _ = surface;
-    try self.device.display.makeCurrent(null, null, self.egl_context);
+    try self.device.display.makeCurrent(null, null, self.wsi_context);
     // Load our function pointers for this thread's threadlocal.
-    try prepareContext(&gl.egl.getProcAddress);
+    try prepareContext(&wsi.getProcAddress);
 }
 
 /// Callback called by renderer.Thread when it exits. Called on the render
@@ -274,7 +267,25 @@ pub fn initTarget(self: *const OpenGL, width: usize, height: usize) !Target {
 /// of the frame and is responsible for freeing it.
 ///
 /// This runs on the render thread.
-pub fn present(
+pub const present = if (builtin.target.os.tag == .windows) presentMemory else presentDmabuf;
+
+/// Windows presentation: DMABUF export is Linux-only, so frames are always
+/// copied back to CPU memory and handed to the apprt.
+fn presentMemory(
+    self: *OpenGL,
+    target: Target,
+    presentation_health: rendererpkg.Health,
+) !ExportedFrame {
+    _ = presentation_health;
+    return .{ .memory = .{
+        .width = @intCast(target.width),
+        .height = @intCast(target.height),
+        .pixels = try target.readPixelsAlloc(self.alloc),
+        .alloc = self.alloc,
+    } };
+}
+
+fn presentDmabuf(
     self: *OpenGL,
     target: Target,
     presentation_health: rendererpkg.Health,
@@ -282,7 +293,7 @@ pub fn present(
     // We only export DMABUFs when the apprt can present them.
     // Otherwise, use CPU buffers.
     if (presentation_health == .healthy) {
-        if (target.exportDmabuf(self.device.display, self.egl_context)) |dmabuf| {
+        if (target.exportDmabuf(self.device.display, self.wsi_context)) |dmabuf| {
             return .{ .dmabuf = dmabuf };
         } else |_| {
             log.warn("failed to export DMABUF, falling back to CPU presentation", .{});

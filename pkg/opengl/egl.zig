@@ -90,7 +90,46 @@ pub fn hasExtension(exts: []const u8, name: []const u8) bool {
     return false;
 }
 
+/// EGL_BAD_PARAMETER from eglGetPlatformDisplay means that no loaded
+/// EGL driver supports the surfaceless platform. Most often that is
+/// because no driver could be loaded at all, for example because the
+/// system's driver needs a newer libc than Ghostty was built against,
+/// so say which it is rather than leaving a bare error name.
+fn logUnsupportedPlatform() void {
+    // With no driver loaded, libglvnd reports no client extensions
+    // at all, since every platform comes from a driver.
+    const exts = queryClientExtensions() orelse "";
+    if (exts.len == 0) {
+        log.err("no EGL driver could be loaded; check that a GPU driver " ++
+            "is installed and was built against a compatible libc " ++
+            "(LD_DEBUG=libs shows why a driver failed to load)", .{});
+        return;
+    }
+
+    if (!hasExtension(exts, "EGL_MESA_platform_surfaceless")) {
+        log.err("the EGL driver does not support EGL_MESA_platform_surfaceless " ++
+            "client extensions={s}", .{exts});
+        return;
+    }
+
+    log.err("the EGL driver rejected the surfaceless platform; " ++
+        "client extensions={s}", .{exts});
+}
+
 pub const Display = opaque {
+    /// The systemwide default display, using the surfaceless platform so
+    /// that contexts can be created without a window system.
+    pub fn initDefault() Error!*Display {
+        return initPlatform(
+            c.EGL_PLATFORM_SURFACELESS_MESA,
+            c.EGL_DEFAULT_DISPLAY,
+            null,
+        ) catch |err| {
+            if (err == error.BadParameter) logUnsupportedPlatform();
+            return err;
+        };
+    }
+
     pub fn initPlatform(
         platform: c.EGLenum,
         id: c.EGLNativeDisplayType,
@@ -137,6 +176,19 @@ pub const Display = opaque {
 };
 
 pub const Config = opaque {
+    /// Choose a config that is renderable with OpenGL and has an RGBA8
+    /// color buffer, which is what every Ghostty render target needs.
+    pub fn chooseDefault(display: *Display) Error!*Config {
+        return choose(display, &.{
+            c.EGL_SURFACE_TYPE,    0,
+            c.EGL_RENDERABLE_TYPE, c.EGL_OPENGL_BIT,
+            c.EGL_RED_SIZE,        8,
+            c.EGL_GREEN_SIZE,      8,
+            c.EGL_BLUE_SIZE,       8,
+            c.EGL_ALPHA_SIZE,      8,
+        });
+    }
+
     pub fn choose(display: *Display, attrs: [:c.EGL_NONE]const c.EGLint) Error!*Config {
         var config: c.EGLConfig = undefined;
         var num_config: c.EGLint = 0;
@@ -156,6 +208,18 @@ pub const Config = opaque {
 pub const Surface = opaque {};
 
 pub const Context = opaque {
+    /// Create a surface-less OpenGL 4.3 core profile context.
+    ///
+    /// Ghostty always renders into its own framebuffer objects, so the
+    /// context never needs a drawable.
+    pub fn createDefault(display: *Display, config: *Config) Error!*Context {
+        return create(display, config, null, &.{
+            c.EGL_CONTEXT_MAJOR_VERSION,       4,
+            c.EGL_CONTEXT_MINOR_VERSION,       3,
+            c.EGL_CONTEXT_OPENGL_PROFILE_MASK, c.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+        });
+    }
+
     pub fn create(
         display: *Display,
         config: *Config,

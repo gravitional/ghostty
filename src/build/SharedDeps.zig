@@ -224,17 +224,33 @@ pub fn add(
     // POSIX C imports that are used throughout Ghostty on a general basis.
     // (note: errno is C stdlib but we just include it here because that's
     // where it's generally included otherwise)
-    try translate_c.addImportToModule(b, "posix_c", step.root_module, .{
-        .source = .{ .includes = .{ .files = &.{
-            .{ .path = "errno.h" },
-            .{ .path = "pwd.h" },
-            .{ .path = "signal.h" },
-            .{ .path = "sys/types.h" },
-            .{ .path = "unistd.h" },
-        } } },
-        .target = target,
-        .optimize = optimize,
-    });
+    //
+    // Windows has no `pwd.h` or `unistd.h`. Every code path that would use
+    // them is comptime-excluded there, so we only translate the headers the
+    // C runtime does provide.
+    switch (target.result.os.tag) {
+        .windows => try translate_c.addImportToModule(b, "posix_c", step.root_module, .{
+            .source = .{ .includes = .{ .files = &.{
+                .{ .path = "errno.h" },
+                .{ .path = "signal.h" },
+                .{ .path = "sys/types.h" },
+            } } },
+            .target = target,
+            .optimize = optimize,
+        }),
+
+        else => try translate_c.addImportToModule(b, "posix_c", step.root_module, .{
+            .source = .{ .includes = .{ .files = &.{
+                .{ .path = "errno.h" },
+                .{ .path = "pwd.h" },
+                .{ .path = "signal.h" },
+                .{ .path = "sys/types.h" },
+                .{ .path = "unistd.h" },
+            } } },
+            .target = target,
+            .optimize = optimize,
+        }),
+    }
 
     // Freetype. We always include this even if our font backend doesn't
     // use it because Dear Imgui uses Freetype.
@@ -661,8 +677,13 @@ pub fn add(
         }
     }
 
+    // Windows links an import library for every symbol, so unlike an ELF
+    // shared library the lib build itself must resolve glad and the Win32
+    // GL entry points.
+    const windows_gl = target.result.os.tag == .windows;
+
     // If we're building an exe then we have additional dependencies.
-    if (step.kind != .lib) {
+    if (step.kind != .lib or windows_gl) {
         // We always statically compile glad
         step.root_module.addIncludePath(b.path("vendor/glad/include/"));
         step.root_module.addCSourceFile(.{
@@ -670,8 +691,16 @@ pub fn add(
             .flags = &.{},
         });
 
+        // WGL lives in opengl32.dll; the helper window and pixel format
+        // calls come from user32/gdi32.
+        if (windows_gl) {
+            step.root_module.linkSystemLibrary("opengl32", .{});
+            step.root_module.linkSystemLibrary("gdi32", .{});
+            step.root_module.linkSystemLibrary("user32", .{});
+        }
+
         // Link EGL for GTK.
-        if (self.config.app_runtime == .gtk) {
+        if (self.config.app_runtime == .gtk and !windows_gl) {
             step.root_module.addCSourceFile(.{
                 .file = b.path("vendor/glad/src/glad_egl.c"),
                 .flags = &.{},
