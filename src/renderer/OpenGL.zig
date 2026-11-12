@@ -291,8 +291,21 @@ pub const present = if (builtin.target.os.tag == .windows) presentMemory else pr
 ///
 /// This is how WGL applications present: the default framebuffer *is* the
 /// window back buffer, so the GPU never hands the frame to the CPU.
+/// Whether to hand finished frames to the window with WGL (blit to the
+/// default framebuffer plus SwapBuffers) instead of copying them back to the
+/// CPU for the apprt to blit.
+///
+/// Disabled on Windows: presenting this way into our windows yields blank
+/// frames. The blit itself is issued (the frame buffer is bound, the sizes
+/// match and SwapBuffers targets the right device context), yet the window
+/// keeps showing an empty buffer, so every surface appeared blank while its
+/// render thread reported drawing normally. The CPU copy path produces the
+/// correct image, so it stays the default until the WGL path is understood.
+const present_with_wgl = false;
+
 fn presentWindow(self: *OpenGL, target: Target) bool {
     if (comptime builtin.target.os.tag != .windows) return false;
+    if (comptime !present_with_wgl) return false;
 
     gl.disable(gl.c.GL_FRAMEBUFFER_SRGB) catch return false;
     defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch {};
