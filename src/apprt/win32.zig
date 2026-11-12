@@ -622,15 +622,10 @@ pub const App = struct {
         frame.selectTab(tab_index);
         frame.layoutTab(tab_index);
 
-        // The first frames are presented before the popup is on screen and
-        // the window only shows them once its drawable has been resized, so
-        // nudge the size and ask for another frame.
+        // Ask for a frame now that the pane is placed and on screen. The
+        // pane must not be moved here: layoutTab already positioned it, and
+        // resizing it to the whole content area would undo a split.
         _ = ShowWindow(surface.hwnd, SW_SHOW);
-        const rect = frame.contentRect();
-        const width = @max(1, rect.right - rect.left);
-        const height = @max(1, rect.bottom - rect.top);
-        _ = MoveWindow(surface.hwnd, rect.left, rect.top, width - 1, height - 1, 1);
-        _ = MoveWindow(surface.hwnd, rect.left, rect.top, width, height, 1);
         surface.core_surface.refreshCallback() catch {};
 
         return surface;
