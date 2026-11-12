@@ -1400,6 +1400,18 @@ fn frameProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c)
             return 0;
         },
 
+        WM_TIMER => {
+            // The tick timer lives on the frame window, so this is where the
+            // core tick and the presentation pump have to run.
+            if (app_instance) |app| {
+                app.core_app.tick(app) catch |err| {
+                    log.err("core tick failed err={}", .{err});
+                };
+                if (frame) |f| f.invalidatePanes();
+            }
+            return 0;
+        },
+
         WM_CLOSE => {
             if (frame) |f| f.closeAll();
             return 0;
@@ -1990,9 +2002,9 @@ pub const Surface = struct {
     /// Pull the latest exported frame and blit it into the window.
     fn presentFrame(self: *Surface) void {
         const frame = self.core_surface.renderer.takeFrame() orelse {
-            log.debug("paint with no frame available", .{});
             return;
         };
+
         defer frame.deinit();
 
         switch (frame) {
