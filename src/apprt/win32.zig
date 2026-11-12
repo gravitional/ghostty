@@ -593,7 +593,12 @@ pub const App = struct {
         // action, for example) still own runtime memory. Destroying a frame
         // closes its tabs, which frees everything.
         while (self.frames.items.len > 0) {
-            _ = DestroyWindow(self.frames.items[0].hwnd);
+            const frame = self.frames.items[0];
+            // If the window is already gone DestroyWindow fails and the
+            // frame would stay in the list, so release it directly. Without
+            // this the loop spun forever and the process never exited after
+            // the shell ended.
+            if (DestroyWindow(frame.hwnd) == 0) self.destroyFrame(frame);
         }
     }
 
@@ -1446,7 +1451,16 @@ fn frameProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c)
         },
 
         WM_CLOSE => {
-            if (frame) |f| f.closeAll();
+            if (frame) |f| {
+                f.closeAll();
+                // Panes destroy themselves as they close. Once the last one
+                // is gone the frame has to go too, otherwise the message
+                // loop never receives WM_QUIT and the process stays alive
+                // after the shell exits.
+                if (f.tabs.items.len == 0) _ = DestroyWindow(hwnd);
+            } else {
+                _ = DestroyWindow(hwnd);
+            }
             return 0;
         },
 
