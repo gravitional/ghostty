@@ -543,6 +543,13 @@ pub const App = struct {
 
     pub fn terminate(self: *App) void {
         if (self.keymap) |*v| v.deinit();
+        const alloc = self.core_app.alloc;
+        for (self.retired_configs.items) |*retired| retired.deinit();
+        self.retired_configs.deinit(alloc);
+
+        for (self.retired_surfaces.items) |surface| alloc.destroy(surface);
+        self.retired_surfaces.deinit(alloc);
+
         self.config.deinit();
         app_instance = null;
     }
