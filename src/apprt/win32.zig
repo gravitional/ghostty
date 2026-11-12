@@ -149,6 +149,15 @@ extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.c) UINT;
 extern "user32" fn GetConsoleWindow() callconv(.c) ?HWND;
 extern "kernel32" fn GetConsoleProcessList(lpdwProcessList: [*]DWORD, dwProcessCount: DWORD) callconv(.c) DWORD;
 extern "user32" fn SetCapture(hWnd: HWND) callconv(.c) ?HWND;
+extern "user32" fn OpenClipboard(hWndNewOwner: ?HWND) callconv(.c) BOOL;
+extern "user32" fn CloseClipboard() callconv(.c) BOOL;
+extern "user32" fn EmptyClipboard() callconv(.c) BOOL;
+extern "user32" fn GetClipboardData(uFormat: UINT) callconv(.c) ?HANDLE;
+extern "user32" fn SetClipboardData(uFormat: UINT, hMem: HANDLE) callconv(.c) ?HANDLE;
+extern "kernel32" fn GlobalAlloc(uFlags: UINT, dwBytes: usize) callconv(.c) ?HANDLE;
+extern "kernel32" fn GlobalLock(hMem: HANDLE) callconv(.c) ?*anyopaque;
+extern "kernel32" fn GlobalUnlock(hMem: HANDLE) callconv(.c) BOOL;
+extern "kernel32" fn GlobalFree(hMem: HANDLE) callconv(.c) ?HANDLE;
 extern "user32" fn ReleaseCapture() callconv(.c) BOOL;
 extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: LPCWSTR) callconv(.c) ?HCURSOR;
 extern "user32" fn AdjustWindowRectEx(lpRect: *RECT, dwStyle: DWORD, bMenu: BOOL, dwExStyle: DWORD) callconv(.c) BOOL;
@@ -230,6 +239,9 @@ const GWLP_USERDATA: c_int = -21;
 const IDC_ARROW: LPCWSTR = @ptrFromInt(32512);
 const SRCCOPY: DWORD = 0x00CC_0020;
 
+const CF_UNICODETEXT: UINT = 13;
+const GMEM_MOVEABLE: UINT = 0x0002;
+
 const VK_SHIFT: c_int = 0x10;
 const VK_CONTROL: c_int = 0x11;
 const VK_MENU: c_int = 0x12;
@@ -309,6 +321,9 @@ pub const App = struct {
         // Opt into per-monitor DPI scaling before any window exists so
         // that coordinates and fonts are in real device pixels. Without
         // this Windows bitmap-stretches the whole window.
+        // The manifest already declares PerMonitorV2, so this normally
+        // fails with access denied; call it anyway for builds that do not
+        // carry the manifest.
         _ = SetProcessDpiAwarenessContext(dpi_aware_v2);
 
         // Create the initial window before entering the loop.
@@ -475,6 +490,18 @@ pub const Surface = struct {
 
         _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
+        // The client area is not necessarily the size we asked for: DPI
+        // scaling and the non-client frame change it. Adopt the real size
+        // before the core lays out its grid from it, otherwise the last
+        // few rows and columns of the window are never painted.
+        var client: RECT = undefined;
+        if (GetClientRect(hwnd, &client) != 0) {
+            self.size = .{
+                .width = @intCast(client.right),
+                .height = @intCast(client.bottom),
+            };
+        }
+
         const dpi = GetDpiForWindow(hwnd);
         if (dpi > 0) {
             const scale = @as(f32, @floatFromInt(dpi)) / base_dpi;
@@ -540,18 +567,35 @@ pub const Surface = struct {
         return clipboard_type == .standard;
     }
 
-    /// Clipboard reads are not implemented yet; callers treat the error as
-    /// "nothing to paste" rather than hanging on a request that will never
-    /// complete.
+    /// Read text from the Windows clipboard and hand it to the core.
+    ///
+    /// The read is synchronous, and the core copies the contents during
+    /// the completion call, so the buffer can be freed right after.
     pub fn clipboardRequest(
         self: *Surface,
         clipboard_type: apprt.Clipboard,
         state: apprt.ClipboardRequest,
     ) !apprt.ClipboardReadResult {
-        _ = self;
-        _ = clipboard_type;
-        _ = state;
-        return error.Unsupported;
+        // Windows has one clipboard; there is no primary selection.
+        if (clipboard_type != .standard) return .unsupported;
+
+        const alloc = self.app.core_app.alloc;
+        const text = readClipboardText(alloc) orelse return .unavailable;
+        defer alloc.free(text);
+
+        const available = [_][]const u8{"text/plain"};
+        self.core_surface.completeClipboardRequest(state, .{
+            .contents = &.{.{ .mime = "text/plain", .data = text }},
+            .available = &available,
+            // TODO: surface Ghostty's unsafe-paste confirmation before
+            // treating every paste as confirmed.
+            .confirmed = true,
+        }) catch |err| {
+            log.warn("clipboard completion failed err={}", .{err});
+            return .unsupported;
+        };
+
+        return .started;
     }
 
     pub fn setClipboard(
@@ -560,11 +604,19 @@ pub const Surface = struct {
         contents: []const apprt.ClipboardContent,
         confirm: bool,
     ) !void {
-        _ = self;
-        _ = clipboard_type;
-        _ = contents;
         _ = confirm;
-        return error.Unsupported;
+        if (clipboard_type != .standard) return;
+
+        const alloc = self.app.core_app.alloc;
+        for (contents) |content| {
+            if (!std.mem.eql(u8, content.mime, "text/plain")) continue;
+
+            writeClipboardText(alloc, content.data) catch |err| {
+                log.warn("failed to write clipboard err={}", .{err});
+                return err;
+            };
+            return;
+        }
     }
 
     pub fn refresh(self: *Surface) void {
@@ -667,6 +719,7 @@ pub const Surface = struct {
             @abs(self.cursor_pos.y - pos.y) < 1) return;
 
         self.cursor_pos = pos;
+
         self.core_surface.cursorPosCallback(pos, currentMods()) catch |err| {
             log.err("error in cursor pos callback err={}", .{err});
         };
@@ -934,6 +987,52 @@ fn surfaceFromWindow(hwnd: HWND) ?*Surface {
     const value = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if (value == 0) return null;
     return @ptrFromInt(@as(usize, @bitCast(value)));
+}
+
+/// Read the clipboard as a NUL-terminated UTF-8 string, or null when it
+/// holds no text.
+fn readClipboardText(alloc: Allocator) ?[:0]u8 {
+    if (OpenClipboard(null) == 0) return null;
+    defer _ = CloseClipboard();
+
+    const handle = GetClipboardData(CF_UNICODETEXT) orelse return null;
+    const locked = GlobalLock(handle) orelse return null;
+    defer _ = GlobalUnlock(handle);
+
+    const wide: [*:0]const u16 = @ptrCast(@alignCast(locked));
+    const units = std.mem.span(wide);
+
+    const utf8 = std.unicode.utf16LeToUtf8Alloc(alloc, units) catch return null;
+    defer alloc.free(utf8);
+
+    return alloc.dupeSentinel(u8, utf8, 0) catch null;
+}
+
+/// Replace the clipboard contents with `text`.
+///
+/// The system takes ownership of the global memory block on success, so
+/// it must not be freed here in that case.
+fn writeClipboardText(alloc: Allocator, text: []const u8) !void {
+    const wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, text);
+    defer alloc.free(wide);
+
+    if (OpenClipboard(null) == 0) return error.ClipboardBusy;
+    defer _ = CloseClipboard();
+
+    if (EmptyClipboard() == 0) return error.ClipboardBusy;
+
+    const bytes = (wide.len + 1) * @sizeOf(u16);
+    const mem = GlobalAlloc(GMEM_MOVEABLE, bytes) orelse return error.OutOfMemory;
+    errdefer _ = GlobalFree(mem);
+
+    const locked = GlobalLock(mem) orelse return error.OutOfMemory;
+    defer _ = GlobalUnlock(mem);
+
+    const src: [*]const u8 = @ptrCast(wide.ptr);
+    const dst: [*]u8 = @ptrCast(locked);
+    @memcpy(dst[0..bytes], src[0..bytes]);
+
+    if (SetClipboardData(CF_UNICODETEXT, mem) == null) return error.ClipboardBusy;
 }
 
 /// Cursor position, in device pixels, from a mouse message's lParam.
