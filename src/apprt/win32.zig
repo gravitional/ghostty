@@ -277,6 +277,7 @@ extern "user32" fn ReleaseCapture() callconv(.c) BOOL;
 extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: LPCWSTR) callconv(.c) ?HCURSOR;
 extern "user32" fn AdjustWindowRectEx(lpRect: *RECT, dwStyle: DWORD, bMenu: BOOL, dwExStyle: DWORD) callconv(.c) BOOL;
 extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.c) BOOL;
+extern "user32" fn IsZoomed(hWnd: HWND) callconv(.c) BOOL;
 
 extern "gdi32" fn StretchDIBits(
     hdc: HDC,
@@ -657,6 +658,17 @@ pub const App = struct {
         alloc.destroy(frame);
     }
 
+    /// The window a target belongs to.
+    fn targetFrame(self: *App, target: apprt.Target) ?*Frame {
+        return switch (target) {
+            .surface => |surface| surface.rt_surface.frame,
+            .app => if (self.frames.items.len > 0)
+                self.frames.items[self.frames.items.len - 1]
+            else
+                null,
+        };
+    }
+
     /// Apply a command received over IPC.
     fn handleIpc(self: *App, tag_raw: u32) void {
         const tag: IpcTag = switch (tag_raw) {
@@ -740,6 +752,37 @@ pub const App = struct {
                     const surface = target.surface.rt_surface;
                     if (surface.frame) |frame| {
                         if (frame.tabIndex(surface)) |index| frame.closeTab(index);
+                    }
+                }
+                return true;
+            },
+
+            .close_window => {
+                if (self.targetFrame(target)) |frame| frame.closeAll();
+                return true;
+            },
+
+            .close_all_windows => {
+                for (self.frames.items) |frame| frame.closeAll();
+                return true;
+            },
+
+            .toggle_maximize, .toggle_fullscreen => {
+                // Fullscreen is implemented as a maximized window for now.
+                if (self.targetFrame(target)) |frame| toggleMaximize(frame);
+                return true;
+            },
+
+            .goto_split => {
+                const surface: ?*Surface = switch (target) {
+                    .surface => |s| s.rt_surface,
+                    else => null,
+                };
+                if (surface) |surf| {
+                    if (surf.frame) |frame| {
+                        if (frame.tabIndex(surf)) |index| {
+                            frame.gotoSplit(index, value);
+                        }
                     }
                 }
                 return true;
@@ -1051,6 +1094,35 @@ pub const Frame = struct {
         _ = SetWindowTextW(self.hwnd, wide.ptr);
     }
 
+    /// Move focus to the pane in a direction.
+    fn gotoSplit(self: *Frame, tab_index: usize, direction: apprt.action.GotoSplit) void {
+        if (tab_index >= self.tabs.items.len) return;
+
+        const tab = &self.tabs.items[tab_index];
+        const count = tab.panes.items.len;
+        if (count <= 1) return;
+
+        const step: usize = switch (direction) {
+            .previous, .left, .up => count - 1,
+            .next, .right, .down => 1,
+        };
+
+        self.selectPane(tab_index, (tab.active + step) % count);
+    }
+
+    fn selectPane(self: *Frame, tab_index: usize, pane_index: usize) void {
+        if (tab_index >= self.tabs.items.len) return;
+
+        const tab = &self.tabs.items[tab_index];
+        if (pane_index >= tab.panes.items.len) return;
+
+        tab.active = pane_index;
+
+        const pane = tab.panes.items[pane_index];
+        _ = SetWindowPos(pane.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        _ = SetFocus(pane.hwnd);
+    }
+
     /// Close every pane of a tab.
     fn closeTab(self: *Frame, index: usize) void {
         if (index >= self.tabs.items.len) return;
@@ -1210,6 +1282,12 @@ fn paintTabBar(frame: *Frame, hwnd: HWND) void {
             0x1 | 0x4 | 0x20, // CENTER | VCENTER | SINGLELINE
         );
     }
+}
+
+fn toggleMaximize(frame: *Frame) void {
+    const SW_MAXIMIZE: c_int = 3;
+    const SW_RESTORE: c_int = 9;
+    _ = ShowWindow(frame.hwnd, if (IsZoomed(frame.hwnd) != 0) SW_RESTORE else SW_MAXIMIZE);
 }
 
 fn placePane(surface: *Surface, rect: RECT) void {
