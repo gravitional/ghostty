@@ -2245,6 +2245,8 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
         },
 
         WM_KEYDOWN, WM_SYSKEYDOWN => {
+            // Input should be drawn right away, not on the next idle tick.
+            if (self.frame) |f| f.idle_ticks = 0;
             const vk: u32 = @intCast(wParam & 0xFFFF);
 
             // Let the system handle Alt+F4 and friends.

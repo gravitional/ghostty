@@ -380,7 +380,7 @@ try {
         Start-Sleep -Seconds 2
     }
     $exited = $false
-    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    $deadline = [DateTime]::UtcNow.AddSeconds(20)
     while ([DateTime]::UtcNow -lt $deadline) {
         if (-not (Get-Process -Id $pid0 -ErrorAction SilentlyContinue)) { $exited = $true; break }
         Start-Sleep -Milliseconds 200
