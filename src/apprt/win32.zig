@@ -1244,8 +1244,13 @@ pub const Frame = struct {
         for (self.tabs.items[self.active].panes.items) |pane| {
             // Wake the render thread so it draws whatever changed, then ask
             // for a paint so the newest frame is blitted.
+            // The renderer only redraws when it is asked to, so a tick
+            // without this refresh would never produce a frame.
             pane.core_surface.refreshCallback() catch {};
-            _ = InvalidateRect(pane.hwnd, null, 0);
+
+            // Present directly instead of invalidating: InvalidateRect made
+            // the window repaint whether or not a frame was ready.
+            pane.presentFrame();
         }
     }
 
