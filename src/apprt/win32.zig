@@ -135,6 +135,17 @@ extern "user32" fn SetTimer(hWnd: HWND, nIDEvent: usize, uElapse: UINT, lpTimerF
 extern "user32" fn KillTimer(hWnd: HWND, uIDEvent: usize) callconv(.c) BOOL;
 extern "user32" fn SetFocus(hWnd: ?HWND) callconv(.c) ?HWND;
 extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.c) BOOL;
+extern "user32" fn SetWindowPos(
+    hWnd: HWND,
+    hWndInsertAfter: ?HWND,
+    x: c_int,
+    y: c_int,
+    cx: c_int,
+    cy: c_int,
+    uFlags: UINT,
+) callconv(.c) BOOL;
+extern "user32" fn SetProcessDpiAwarenessContext(value: ?*anyopaque) callconv(.c) BOOL;
+extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.c) UINT;
 extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: LPCWSTR) callconv(.c) ?HCURSOR;
 extern "user32" fn AdjustWindowRectEx(lpRect: *RECT, dwStyle: DWORD, bMenu: BOOL, dwExStyle: DWORD) callconv(.c) BOOL;
 extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.c) BOOL;
@@ -178,6 +189,7 @@ const WM_KILLFOCUS: UINT = 0x0008;
 const WM_PAINT: UINT = 0x000F;
 const WM_CLOSE: UINT = 0x0010;
 const WM_TIMER: UINT = 0x0113;
+const WM_DPICHANGED: UINT = 0x02E0;
 const WM_KEYDOWN: UINT = 0x0100;
 const WM_KEYUP: UINT = 0x0101;
 const WM_CHAR: UINT = 0x0102;
@@ -190,6 +202,14 @@ const WM_APP_WAKEUP: UINT = 0x8001;
 const WS_OVERLAPPEDWINDOW: DWORD = 0x00CF_0000;
 const WS_VISIBLE: DWORD = 0x1000_0000;
 const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x8000_0000));
+const SWP_NOZORDER: UINT = 0x0004;
+
+/// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, a pseudo-handle with the
+/// value -4.
+const dpi_aware_v2: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -4))));
+
+/// DPI that Windows considers 100% scaling.
+const base_dpi: f32 = 96;
 const SW_SHOW: c_int = 5;
 const GWLP_USERDATA: c_int = -21;
 const IDC_ARROW: LPCWSTR = @ptrFromInt(32512);
@@ -269,6 +289,11 @@ pub const App = struct {
     }
 
     pub fn run(self: *App) !void {
+        // Opt into per-monitor DPI scaling before any window exists so
+        // that coordinates and fonts are in real device pixels. Without
+        // this Windows bitmap-stretches the whole window.
+        _ = SetProcessDpiAwarenessContext(dpi_aware_v2);
+
         // Create the initial window before entering the loop.
         const alloc = self.core_app.alloc;
         const surface = try alloc.create(Surface);
@@ -302,6 +327,13 @@ pub const App = struct {
             _ = TranslateMessage(&msg);
             _ = DispatchMessageW(&msg);
         }
+
+        // The core tears its own surface down when the shell exits (it
+        // stops the render and IO threads before we get here), so we only
+        // release the memory this runtime allocated.
+        if (surface.pixels.len > 0) alloc.free(surface.pixels);
+        if (surface.title) |title| alloc.free(title);
+        alloc.destroy(surface);
     }
 
     /// Wake up the event loop so the core can process its mailbox.
@@ -323,11 +355,17 @@ pub const App = struct {
         value: apprt.Action.Value(action),
     ) !bool {
         _ = self;
-        _ = value;
 
         switch (action) {
             .quit => {
                 _ = PostQuitMessage(0);
+                return true;
+            },
+
+            .set_title => {
+                if (target == .surface) {
+                    target.surface.rt_surface.setTitle(value.title);
+                }
                 return true;
             },
 
@@ -419,6 +457,12 @@ pub const Surface = struct {
         self.hwnd = hwnd;
 
         _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+
+        const dpi = GetDpiForWindow(hwnd);
+        if (dpi > 0) {
+            const scale = @as(f32, @floatFromInt(dpi)) / base_dpi;
+            self.content_scale = .{ .x = scale, .y = scale };
+        }
 
         // Register with the core before initializing so that callbacks can
         // find us.
@@ -552,7 +596,7 @@ pub const Surface = struct {
         const alloc = self.app.core_app.alloc;
         if (self.title) |v| alloc.free(v);
 
-        const owned = alloc.dupeZ(u8, title) catch return;
+        const owned = alloc.dupeSentinel(u8, title, 0) catch return;
         self.title = owned;
 
         const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, owned) catch return;
@@ -719,6 +763,25 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
         // Text already travelled with the key event above; swallowing
         // WM_CHAR keeps it from being inserted twice.
         WM_CHAR, WM_SYSCHAR => return 0,
+
+        WM_DPICHANGED => {
+            const new_dpi: u32 = @intCast(wParam & 0xFFFF);
+            const scale: f64 = @as(f64, @floatFromInt(new_dpi)) / base_dpi;
+            self.updateContentScale(scale, scale);
+
+            // Windows suggests the new outer rect for this DPI; honour it.
+            const suggested: *const RECT = @ptrFromInt(@as(usize, @bitCast(lParam)));
+            _ = SetWindowPos(
+                hwnd,
+                null,
+                suggested.left,
+                suggested.top,
+                suggested.right - suggested.left,
+                suggested.bottom - suggested.top,
+                SWP_NOZORDER,
+            );
+            return 0;
+        },
 
         WM_SETFOCUS => {
             self.core_surface.focusCallback(true) catch {};
