@@ -26,6 +26,10 @@ pub const Options = struct {
     /// Caller is responsible for managing the lifetime of the display.
     /// The default display will be used when null.
     display: ?*wsi.Display = null,
+
+    /// Window to bind the GL context to when the app runtime wants frames
+    /// presented with `SwapBuffers` instead of read back. Opaque here.
+    window_handle: ?*anyopaque = null,
 };
 
 /// The window-system display.
@@ -45,7 +49,11 @@ pub fn init(alloc: Allocator, options: Options) !*Device {
 
     try wsi.load();
 
-    const display = options.display orelse try wsi.Display.initDefault();
+    const display = options.display orelse
+        if (options.window_handle) |handle|
+            try wsi.Display.initForWindow(handle)
+        else
+            try wsi.Display.initDefault();
 
     log.info("GL vendor={s}", .{display.queryString(.vendor) orelse "(unknown)"});
     log.info("GL extensions={s}", .{display.queryString(.extensions) orelse "(unknown)"});

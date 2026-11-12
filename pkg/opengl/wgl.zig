@@ -4,10 +4,11 @@
 //! Ghostty uses, so the renderer can pick a window-system integration at
 //! comptime without knowing which one it got.
 //!
-//! A hidden helper window owns the device context the GL context is bound
-//! to. Ghostty renders into its own framebuffer objects and presents the
-//! result itself (GPU->CPU readback on Windows), so no swap chain is
-//! needed here: the helper window is never shown.
+//! By default a hidden helper window owns the device context, which is
+//! enough for offscreen rendering. When the app runtime passes its own
+//! window, the context is bound to that window's device context instead and
+//! frames are presented with `SwapBuffers`, the WGL equivalent of
+//! `eglSwapBuffers`.
 //!
 //! Only the Win32 entry points we actually use are declared. Zig's Windows
 //! std API surface has been churning, and this package is deliberately
@@ -207,7 +208,12 @@ pub fn hasExtension(exts: []const u8, name: []const u8) bool {
 pub const Display = struct {
     hwnd: HWND,
     hdc: HDC,
-    class_name: [:0]const u16,
+
+    /// True when this display created `hwnd` and must destroy it. The app
+    /// runtime owns its window, so displays made from it must not.
+    owned: bool = true,
+
+    class_name: ?[:0]const u16 = null,
 
     /// The single pixel format chosen by `Config.choose`. WGL configs are
     /// not separate objects, so the config is stored on the display.
@@ -263,10 +269,40 @@ pub const Display = struct {
         return self;
     }
 
+    /// Create a display bound to an existing window.
+    ///
+    /// Binding to the real window is what allows presenting with
+    /// `SwapBuffers` instead of reading the frame back to the CPU: the
+    /// default framebuffer then is the window's back buffer.
+    pub fn initForWindow(window: *anyopaque) Error!*Display {
+        const self = std.heap.page_allocator.create(Display) catch return error.BadAlloc;
+        errdefer std.heap.page_allocator.destroy(self);
+
+        const hwnd: HWND = @ptrCast(@alignCast(window));
+        const hdc = GetDC(hwnd) orelse {
+            log.err("GetDC failed error={d}", .{GetLastError()});
+            return error.BadNativeWindow;
+        };
+
+        self.* = .{
+            .hwnd = hwnd,
+            .hdc = hdc,
+            .owned = false,
+        };
+        return self;
+    }
+
     pub fn terminate(self: *Display) void {
         _ = ReleaseDC(self.hwnd, self.hdc);
-        _ = DestroyWindow(self.hwnd);
+        if (self.owned) _ = DestroyWindow(self.hwnd);
         std.heap.page_allocator.destroy(self);
+    }
+
+    /// Present the current back buffer, like `eglSwapBuffers`.
+    pub fn swapBuffers(self: *Display) void {
+        if (SwapBuffers(self.hdc) == 0) {
+            log.err("SwapBuffers failed error={d}", .{GetLastError()});
+        }
     }
 
     const StringQuery = enum { vendor, renderer, extensions };

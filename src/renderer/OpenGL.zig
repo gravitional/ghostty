@@ -287,14 +287,53 @@ pub fn initTarget(self: *const OpenGL, width: usize, height: usize) !Target {
 /// This runs on the render thread.
 pub const present = if (builtin.target.os.tag == .windows) presentMemory else presentDmabuf;
 
-/// Windows presentation: DMABUF export is Linux-only, so frames are always
-/// copied back to CPU memory and handed to the apprt.
+/// Present by blitting into the window's default framebuffer and swapping.
+///
+/// This is how WGL applications present: the default framebuffer *is* the
+/// window back buffer, so the GPU never hands the frame to the CPU.
+fn presentWindow(self: *OpenGL, target: Target) bool {
+    if (comptime builtin.target.os.tag != .windows) return false;
+
+    gl.disable(gl.c.GL_FRAMEBUFFER_SRGB) catch return false;
+    defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch {};
+
+    const read = target.framebuffer.bind(.read) catch return false;
+    defer read.unbind();
+
+    // Framebuffer zero is the default (window) framebuffer.
+    const draw = (gl.Framebuffer{ .id = 0 }).bind(.draw) catch return false;
+    defer draw.unbind();
+
+    gl.blitFramebuffer(
+        0,
+        0,
+        @intCast(target.width),
+        @intCast(target.height),
+        0,
+        0,
+        @intCast(target.width),
+        @intCast(target.height),
+        .{ .color_buffer_bit = true },
+        .nearest,
+    ) catch return false;
+
+    self.device.display.swapBuffers();
+    return true;
+}
+
+/// Windows presentation: DMABUF export is Linux-only. When the context is
+/// bound to a window the frame is presented directly with SwapBuffers;
+/// otherwise it is copied back to CPU memory and handed to the apprt.
 fn presentMemory(
     self: *OpenGL,
     target: Target,
     presentation_health: rendererpkg.Health,
 ) !ExportedFrame {
     _ = presentation_health;
+
+    // Present straight to the window; nothing to hand back.
+    if (presentWindow(self, target)) return .presented;
+
     return .{ .memory = .{
         .width = @intCast(target.width),
         .height = @intCast(target.height),
@@ -331,6 +370,9 @@ pub const ExportedFrame = union(enum) {
     dmabuf: Dmabuf,
     memory: Memory,
 
+    /// The renderer already presented this frame to the window.
+    presented: void,
+
     /// RGBA8 pixel data with premultiplied alpha, tightly packed
     /// (`width * 4` bytes per row), in CPU memory.
     pub const Memory = struct {
@@ -348,6 +390,7 @@ pub const ExportedFrame = union(enum) {
         switch (self) {
             .dmabuf => |v| v.deinit(),
             .memory => |v| v.deinit(),
+            .presented => {},
         }
     }
 };

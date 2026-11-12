@@ -472,6 +472,10 @@ pub const Surface = struct {
     /// How frames are presented (D3D11 when available, GDI otherwise).
     presenter: Presenter = .gdi,
 
+    /// True once the renderer has presented directly to this window with
+    /// WGL `SwapBuffers`, which means GDI must not paint over it.
+    gl_presented: bool = false,
+
     /// True while an IME composition string is active.
     composing: bool = false,
 
@@ -560,13 +564,10 @@ pub const Surface = struct {
             self.content_scale = .{ .x = scale, .y = scale };
         }
 
-        // Prefer the swap chain; fall back to GDI when D3D11 is missing
-        // (no GPU, old driver, remote session).
-        self.presenter = if (ghostty_d3d11_create(
-            hwnd,
-            @intCast(self.size.width),
-            @intCast(self.size.height),
-        )) |presenter| .{ .d3d11 = presenter } else .gdi;
+        // Frames are presented by the renderer itself through WGL
+        // SwapBuffers now, so no swap chain is created here. GDI remains as
+        // the fallback when the renderer cannot present to the window.
+        self.presenter = .gdi;
 
         log.debug("presenter={s}", .{@tagName(self.presenter)});
 
@@ -700,8 +701,11 @@ pub const Surface = struct {
     }
 
     pub fn renderDeviceOptions(self: *const Surface) !renderer.Device.Options {
-        _ = self;
-        return .{};
+        return .{
+            // Bind the GL context to this window so frames are presented
+            // with SwapBuffers instead of a GPU->CPU readback.
+            .window_handle = @ptrCast(self.hwnd),
+        };
     }
 
     pub fn updateContentScale(self: *Surface, x: f64, y: f64) void {
@@ -868,6 +872,8 @@ pub const Surface = struct {
             .memory => |m| {
                 self.blit(m);
             },
+            // Presented by the renderer itself (WGL SwapBuffers).
+            .presented => self.gl_presented = true,
             // There is no DMABUF path on Windows.
             .dmabuf => {},
         }
@@ -1095,9 +1101,11 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
         },
 
         WM_ERASEBKGND => {
-            // With a swap chain there is nothing to erase: the presented
-            // frame covers the client area, and GDI painting here would
-            // flash black between frames.
+            // Nothing to erase once frames are presented directly: the
+            // window back buffer covers the client area, and GDI painting
+            // here would flash between frames.
+            if (self.gl_presented) return 1;
+
             switch (self.presenter) {
                 .d3d11 => return 1,
                 .gdi => {},
