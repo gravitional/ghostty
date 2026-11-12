@@ -607,11 +607,17 @@ pub const App = struct {
     /// Add a tab (with one pane) to `frame` and focus it.
     fn addTab(self: *App, frame: *Frame, working_directory: ?[]const u8) !void {
         try frame.addTab();
-        _ = try self.createPane(frame, frame.tabs.items.len - 1, working_directory);
+        _ = try self.createPane(frame, frame.tabs.items.len - 1, working_directory, .right);
     }
 
     /// Add a pane to an existing tab.
-    fn createPane(self: *App, frame: *Frame, tab_index: usize, working_directory: ?[]const u8) !*Surface {
+    fn createPane(
+        self: *App,
+        frame: *Frame,
+        tab_index: usize,
+        working_directory: ?[]const u8,
+        direction: apprt.action.SplitDirection,
+    ) !*Surface {
         const alloc = self.core_app.alloc;
 
         const surface = try alloc.create(Surface);
@@ -628,6 +634,7 @@ pub const App = struct {
         errdefer _ = self.surfaces.pop();
 
         try frame.tabs.items[tab_index].panes.append(alloc, surface);
+        try frame.tabs.items[tab_index].dirs.append(alloc, direction);
         surface.frame = frame;
 
         // The core reports its initial title while the surface is still
@@ -694,7 +701,10 @@ pub const App = struct {
             }
         }
 
-        for (frame.tabs.items) |*tab| tab.panes.deinit(alloc);
+        for (frame.tabs.items) |*tab| {
+            tab.panes.deinit(alloc);
+            tab.dirs.deinit(alloc);
+        }
         frame.tabs.deinit(alloc);
         for (frame.titles.items) |title| alloc.free(title);
         frame.titles.deinit(alloc);
@@ -791,7 +801,7 @@ pub const App = struct {
                 const frame = if (surface) |surf| surf.frame else null;
                 if (frame) |f| {
                     const index = f.tabIndex(surface.?) orelse f.active;
-                    _ = try self.createPane(f, index, null);
+                    _ = try self.createPane(f, index, null, value);
                     return true;
                 }
                 return false;
@@ -892,6 +902,10 @@ pub const App = struct {
 /// One tab: a set of panes laid out inside the frame's content area.
 pub const Tab = struct {
     panes: std.ArrayListUnmanaged(*Surface) = .empty,
+
+    /// Split direction that introduced each pane, parallel to `panes`. The
+    /// entry for the first pane is unused.
+    dirs: std.ArrayListUnmanaged(apprt.action.SplitDirection) = .empty,
     /// Focused pane.
     active: usize = 0,
 };
@@ -1064,32 +1078,52 @@ pub const Frame = struct {
         if (index >= self.tabs.items.len) return;
         const rect = self.contentRect();
 
-        const panes = self.tabs.items[index].panes.items;
-        const n = panes.len;
-        if (n == 0) return;
+        const tab = &self.tabs.items[index];
+        const panes = tab.panes.items;
+        if (panes.len == 0) return;
 
-        if (n == 1) {
-            placePane(panes[0], rect);
-            return;
+        // Panes are grouped into rows: a pane that was split downwards or
+        // upwards starts a new row, and every other pane joins the row
+        // before it. Rows share the height, panes in a row share the width.
+        var starts: [64]usize = undefined;
+        var ends: [64]usize = undefined;
+        var rows: usize = 0;
+        for (panes, 0..) |_, i| {
+            const starts_row = i == 0 or switch (tab.dirs.items[i]) {
+                .down, .up => true,
+                else => false,
+            };
+
+            if (starts_row) {
+                if (rows >= starts.len) break;
+                starts[rows] = i;
+                ends[rows] = i + 1;
+                rows += 1;
+            } else {
+                ends[rows - 1] = i + 1;
+            }
         }
+        if (rows == 0) return;
 
-        // Simple layout: panes are stacked in a row of columns, two per
-        // row. A split tree is a later step.
-        const cols: i32 = if (n == 2) 2 else if (n <= 4) 2 else 3;
-        const rows: i32 = @intCast(@divTrunc(@as(usize, n) + @as(usize, @intCast(cols)) - 1, @as(usize, @intCast(cols))));
+        const row_height = @divTrunc(rect.bottom - rect.top, @as(i32, @intCast(rows)));
+        for (starts[0..rows], ends[0..rows], 0..) |row_start, row_end, row| {
+            const count = row_end - row_start;
+            if (count == 0) continue;
 
-        const width = @divTrunc(rect.right - rect.left, cols);
-        const height = @divTrunc(rect.bottom - rect.top, rows);
+            const top = rect.top + @as(i32, @intCast(row)) * row_height;
+            const bottom = if (row == rows - 1) rect.bottom else top + row_height;
+            const col_width = @divTrunc(rect.right - rect.left, @as(i32, @intCast(count)));
 
-        for (panes, 0..) |pane, i| {
-            const col: i32 = @intCast(i % @as(usize, @intCast(cols)));
-            const row: i32 = @intCast(@divTrunc(i, @as(usize, @intCast(cols))));
-            placePane(pane, .{
-                .left = rect.left + col * width,
-                .top = rect.top + row * height,
-                .right = if (col == cols - 1) rect.right else rect.left + (col + 1) * width,
-                .bottom = if (row == rows - 1) rect.bottom else rect.top + (row + 1) * height,
-            });
+            for (panes[row_start..row_end], 0..) |pane, col| {
+                const left = rect.left + @as(i32, @intCast(col)) * col_width;
+                const right = if (col == count - 1) rect.right else left + col_width;
+                placePane(pane, .{
+                    .left = left,
+                    .top = top,
+                    .right = right,
+                    .bottom = bottom,
+                });
+            }
         }
     }
 
@@ -1156,6 +1190,7 @@ pub const Frame = struct {
                 if (pane != surface) continue;
 
                 _ = tab.panes.orderedRemove(pi);
+                if (pi < tab.dirs.items.len) _ = tab.dirs.orderedRemove(pi);
                 surface.frame = null;
 
                 if (tab.panes.items.len == 0) {
