@@ -69,6 +69,29 @@ public class GhosttySmoke {
         return found;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+
+    [StructLayout(LayoutKind.Explicit)]
+    public struct INPUT { [FieldOffset(0)] public uint type; [FieldOffset(8)] public MOUSEINPUT mi; }
+
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+
+    // Wheel messages have to come from the real input queue: a posted
+    // WM_MOUSEWHEEL is not delivered to the surface.
+    public static void Wheel(int x, int y, int notches) {
+        SetCursorPos(x, y);
+        for (int i = 0; i < notches; i++) {
+            var input = new INPUT { type = 0 };
+            input.mi.mouseData = 120;
+            input.mi.dwFlags = 0x0800;
+            SendInput(1, new[] { input }, Marshal.SizeOf(typeof(INPUT)));
+            System.Threading.Thread.Sleep(60);
+        }
+    }
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern int GetWindowTextW(IntPtr hwnd, StringBuilder buf, int size);
 
@@ -236,6 +259,26 @@ try {
         Start-Sleep -Milliseconds 200
     }
     Check 'title: window title follows the shell' ($title -match 'smoketitle') "title=$title"
+
+    # Scrolling back through history changes what is on screen. `set` is used
+    # as the output generator because the typing helper can only send letters.
+    [GhosttySmoke]::Type($pane, 'set')
+    [GhosttySmoke]::Key($pane, 0x0D)
+    Start-Sleep -Seconds 3
+    [GhosttySmoke]::SetForegroundWindow($pane) | Out-Null
+    $scrollBefore = Join-Path $work 'scroll-before.png'
+    Capture-Pane -Pane $pane -Path $scrollBefore
+    $rect = [GhosttySmoke]::Rect($pane)
+    [GhosttySmoke]::Wheel(
+        $rect.Left + [int](($rect.Right - $rect.Left) / 2),
+        $rect.Top + [int](($rect.Bottom - $rect.Top) / 2),
+        15)
+    Start-Sleep -Seconds 1
+    $scrollAfter = Join-Path $work 'scroll-after.png'
+    Capture-Pane -Pane $pane -Path $scrollAfter
+    Check 'scrollback: wheel changes the view' (
+        (Get-FileHash $scrollBefore -Algorithm SHA256).Hash -ne
+        (Get-FileHash $scrollAfter -Algorithm SHA256).Hash)
 
     # A split must produce two panes that do not overlap.
     [GhosttySmoke]::Key($pane, $VK.F9)
