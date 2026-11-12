@@ -625,6 +625,11 @@ pub const App = struct {
 
         try self.addTab(frame, working_directory);
 
+        // WM_SIZE can arrive while the window is still being created, before
+        // the frame pointer is attached, so lay out once explicitly to size
+        // the tab bar and place the pane.
+        frame.layout();
+
         _ = SetForegroundWindow(frame.hwnd);
         _ = SetFocus(frame.hwnd);
 
