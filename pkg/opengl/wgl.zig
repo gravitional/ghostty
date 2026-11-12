@@ -269,11 +269,12 @@ pub const Display = struct {
         std.heap.page_allocator.destroy(self);
     }
 
-    const StringQuery = enum { vendor, extensions };
+    const StringQuery = enum { vendor, renderer, extensions };
 
     pub fn queryString(self: *Display, name: StringQuery) ?[:0]const u8 {
         return switch (name) {
             .vendor => if (glGetString(GL_VENDOR)) |v| std.mem.span(v) else null,
+            .renderer => if (glGetString(0x1F01)) |v| std.mem.span(v) else null,
             .extensions => self.extensions orelse exts: {
                 const v = wglExtensions(self.hdc) orelse break :exts null;
                 self.extensions = v;

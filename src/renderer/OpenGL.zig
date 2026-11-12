@@ -74,6 +74,13 @@ pub fn init(
     // target without a CPU round trip. It is a WGL extension (not a GL
     // one), and only NVIDIA drivers ship it, so callers must treat it as
     // optional.
+    // Which GPU runs GL matters for Direct3D interop: a shared texture is
+    // only usable when both APIs land on one adapter.
+    log.info("GL renderer={s} vendor={s}", .{
+        display.queryString(.renderer) orelse "unknown",
+        display.queryString(.vendor) orelse "unknown",
+    });
+
     if (display.queryString(.extensions)) |exts| {
         log.info("DX interop support={} interop2={}", .{
             wsi.hasExtension(exts, "WGL_NV_DX_interop"),
