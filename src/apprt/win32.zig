@@ -1593,6 +1593,7 @@ fn paintTabBar(frame: *Frame, hwnd: HWND) void {
     const old_font = SelectObject(dc, font);
     defer _ = SelectObject(dc, old_font);
     _ = SetBkMode(dc, 1); // TRANSPARENT
+    _ = SetTextColor(dc, GetSysColor(18)); // COLOR_BTNTEXT
 
     for (frame.titles.items, 0..) |title, i| {
         var rect: RECT = .{
@@ -1625,13 +1626,16 @@ fn paintTabBar(frame: *Frame, hwnd: HWND) void {
             0x1 | 0x4 | 0x20,
         );
 
-        _ = SetTextColor(dc, GetSysColor(18)); // COLOR_BTNTEXT
+        // Keep title text out of the close button's drawing and hit area.
+        var title_rect = rect;
+        title_rect.left += 8;
+        title_rect.right = close_rect.left - 8;
         _ = DrawTextW(
             dc,
             title.ptr,
             @intCast(title.len),
-            &rect,
-            0x1 | 0x4 | 0x20, // CENTER | VCENTER | SINGLELINE
+            &title_rect,
+            0x1 | 0x4 | 0x20 | 0x800 | 0x8000, // CENTER | VCENTER | SINGLELINE | NOPREFIX | END_ELLIPSIS
         );
     }
 }
