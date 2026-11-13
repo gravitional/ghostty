@@ -1070,6 +1070,7 @@ pub const Frame = struct {
     /// Tab labels, UTF-16 so they can be drawn without conversion.
     titles: std.ArrayListUnmanaged([]u16) = .empty,
     active: usize = 0,
+    tab_scroll: usize = 0,
     split_drag: ?SplitDrag = null,
     split_position: ?i32 = null,
     dpi: u32 = 96,
@@ -1208,6 +1209,7 @@ pub const Frame = struct {
     fn selectTab(self: *Frame, index: usize) void {
         if (index >= self.tabs.items.len) return;
         self.active = index;
+        self.ensureActiveTabVisible();
 
         for (self.tabs.items, 0..) |tab, ti| {
             for (tab.panes.items) |pane| {
@@ -1233,6 +1235,47 @@ pub const Frame = struct {
             }
         }
 
+        _ = InvalidateRect(self.tab_bar, null, 1);
+    }
+
+    const TabViewport = struct {
+        left: i32,
+        right: i32,
+        plus_left: i32,
+        capacity: usize,
+        overflow: bool,
+    };
+
+    fn tabViewport(self: *Frame) TabViewport {
+        var client: RECT = undefined;
+        if (GetClientRect(self.tab_bar, &client) == 0) return .{ .left = 0, .right = 0, .plus_left = 0, .capacity = 1, .overflow = false };
+        const width = @max(0, client.right);
+        const plus_left = @max(0, width - self.tab_height);
+        const available = plus_left;
+        const fits = @as(usize, @intCast(@max(0, @divTrunc(available, self.tab_width))));
+        const overflow = self.tabs.items.len > fits;
+        const left = if (overflow) 2 * self.tab_height else 0;
+        const capacity = @max(1, @as(usize, @intCast(@max(0, @divTrunc(available - left, self.tab_width)))));
+        return .{ .left = left, .right = plus_left, .plus_left = plus_left, .capacity = capacity, .overflow = overflow };
+    }
+
+    fn ensureActiveTabVisible(self: *Frame) void {
+        const viewport = self.tabViewport();
+        const max_scroll = self.tabs.items.len -| viewport.capacity;
+        self.tab_scroll = @min(self.tab_scroll, max_scroll);
+        if (self.active < self.tab_scroll) self.tab_scroll = self.active;
+        if (self.active >= self.tab_scroll + viewport.capacity) self.tab_scroll = self.active + 1 - viewport.capacity;
+    }
+
+    fn scrollTabs(self: *Frame, forward: bool) void {
+        const viewport = self.tabViewport();
+        const max_scroll = self.tabs.items.len -| viewport.capacity;
+        const page = @max(1, viewport.capacity);
+        if (forward) {
+            self.tab_scroll = @min(max_scroll, self.tab_scroll + page);
+        } else {
+            self.tab_scroll -|= page;
+        }
         _ = InvalidateRect(self.tab_bar, null, 1);
     }
 
@@ -1425,6 +1468,8 @@ pub const Frame = struct {
         if (GetClientRect(self.hwnd, &client) == 0) return;
 
         _ = MoveWindow(self.tab_bar, 0, 0, client.right, self.tab_height, 1);
+        self.ensureActiveTabVisible();
+        _ = InvalidateRect(self.tab_bar, null, 1);
         self.layoutTab(self.active);
     }
 
@@ -1451,6 +1496,7 @@ pub const Frame = struct {
                         return;
                     }
 
+                    if (ti < self.active) self.active -= 1;
                     if (self.active >= self.tabs.items.len) self.active = self.tabs.items.len - 1;
                     self.selectTab(self.active);
                 } else {
@@ -1772,21 +1818,27 @@ fn tabBarProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
 
         WM_LBUTTONDOWN => {
             const x: i32 = @intCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-            const index = @divTrunc(x, frame.tab_width);
-            const add_left = @as(i32, @intCast(frame.tabs.items.len)) * frame.tab_width;
-            if (x >= add_left and x < add_left + frame.tab_height) {
+            const viewport = frame.tabViewport();
+            if (viewport.overflow and x < viewport.left) {
+                frame.scrollTabs(x >= frame.tab_height);
+                return 0;
+            }
+            if (x >= viewport.plus_left) {
                 frame.app.addTab(frame, null, null) catch |err| {
                     log.err("new tab failed err={}", .{err});
                 };
                 return 0;
             }
-            if (index >= 0 and index < frame.tabs.items.len) {
-                // The right edge of a tab is its close button.
-                const tab_right = (index + 1) * frame.tab_width;
-                if (x >= tab_right - frame.close_width) {
-                    frame.closeTab(@intCast(index));
-                } else {
-                    frame.selectTab(@intCast(index));
+            if (x >= viewport.left and x < viewport.right) {
+                const slot: usize = @intCast(@divTrunc(x - viewport.left, frame.tab_width));
+                const index = frame.tab_scroll + slot;
+                if (slot < viewport.capacity and index < frame.tabs.items.len) {
+                    const tab_right = @min(viewport.right, viewport.left + @as(i32, @intCast(slot + 1)) * frame.tab_width);
+                    if (x >= tab_right - frame.close_width) {
+                        frame.closeTab(index);
+                    } else {
+                        frame.selectTab(index);
+                    }
                 }
             }
             return 0;
@@ -1794,8 +1846,8 @@ fn tabBarProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
 
         WM_RBUTTONUP => {
             const x: i32 = @intCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-            const add_left = @as(i32, @intCast(frame.tabs.items.len)) * frame.tab_width;
-            if (x >= add_left and x < add_left + frame.tab_height) {
+            const viewport = frame.tabViewport();
+            if (x >= viewport.plus_left) {
                 showShellMenu(frame, hwnd);
                 return 0;
             }
@@ -1803,9 +1855,11 @@ fn tabBarProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
 
         WM_MBUTTONDOWN => {
             const x: i32 = @intCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-            const index = @divTrunc(x, frame.tab_width);
-            if (index >= 0 and index < frame.tabs.items.len) {
-                frame.closeTab(@intCast(index));
+            const viewport = frame.tabViewport();
+            if (x >= viewport.left and x < viewport.right) {
+                const slot: usize = @intCast(@divTrunc(x - viewport.left, frame.tab_width));
+                const index = frame.tab_scroll + slot;
+                if (slot < viewport.capacity and index < frame.tabs.items.len) frame.closeTab(index);
             }
             return 0;
         },
@@ -1845,57 +1899,58 @@ fn paintTabBar(frame: *Frame, hwnd: HWND) void {
     _ = SetBkMode(dc, 1); // TRANSPARENT
     _ = SetTextColor(dc, GetSysColor(18)); // COLOR_BTNTEXT
 
-    var add_rect: RECT = .{
-        .left = @as(i32, @intCast(frame.tabs.items.len)) * frame.tab_width,
-        .top = 0,
-        .right = @as(i32, @intCast(frame.tabs.items.len)) * frame.tab_width + frame.tab_height,
-        .bottom = client.bottom,
-    };
+    const viewport = frame.tabViewport();
+    const arrow = std.unicode.utf8ToUtf16LeStringLiteral("<");
     const add_label = std.unicode.utf8ToUtf16LeStringLiteral("+");
+    var add_rect: RECT = .{ .left = viewport.plus_left, .top = 0, .right = client.right, .bottom = client.bottom };
     _ = DrawTextW(dc, add_label.ptr, 1, &add_rect, 0x1 | 0x4 | 0x20);
 
-    for (frame.titles.items, 0..) |title, i| {
+    if (viewport.overflow) {
+        var left_rect: RECT = .{ .left = 0, .top = 0, .right = frame.tab_height, .bottom = client.bottom };
+        var right_rect: RECT = .{ .left = frame.tab_height, .top = 0, .right = viewport.left, .bottom = client.bottom };
+        _ = DrawTextW(dc, arrow.ptr, 1, &left_rect, 0x1 | 0x4 | 0x20);
+        const right_arrow = std.unicode.utf8ToUtf16LeStringLiteral(">");
+        _ = DrawTextW(dc, right_arrow.ptr, 1, &right_rect, 0x1 | 0x4 | 0x20);
+    }
+
+    for (0..viewport.capacity) |slot| {
+        const i = frame.tab_scroll + slot;
+        if (i >= frame.titles.items.len) break;
+        const tab_left = viewport.left + @as(i32, @intCast(slot)) * frame.tab_width;
+        if (tab_left >= viewport.right) break;
         var rect: RECT = .{
-            .left = @as(i32, @intCast(i)) * frame.tab_width,
+            .left = tab_left,
             .top = 0,
-            .right = @as(i32, @intCast(i + 1)) * frame.tab_width,
+            .right = @min(viewport.right, tab_left + frame.tab_width),
             .bottom = client.bottom,
         };
 
         if (i == frame.active) {
-            if (CreateSolidBrush(GetSysColor(5))) |brush| { // COLOR_WINDOW
+            if (CreateSolidBrush(GetSysColor(5))) |brush| {
                 _ = FillRect(dc, &rect, brush);
                 _ = DeleteObject(brush);
             }
         }
 
-        // Close button: a small x at the right edge of the tab.
         var close_rect: RECT = .{
-            .left = rect.right - frame.close_width,
+            .left = @max(rect.left, rect.right - frame.close_width),
             .top = 0,
             .right = rect.right,
             .bottom = client.bottom,
         };
-        var close_label = std.unicode.utf8ToUtf16LeStringLiteral("x");
-        _ = DrawTextW(
-            dc,
-            close_label[0..].ptr,
-            1,
-            &close_rect,
-            0x1 | 0x4 | 0x20,
-        );
+        const close_label = std.unicode.utf8ToUtf16LeStringLiteral("x");
+        _ = DrawTextW(dc, close_label.ptr, 1, &close_rect, 0x1 | 0x4 | 0x20);
 
-        // Keep title text out of the close button's drawing and hit area.
         var title_rect = rect;
         const text_padding: i32 = @intCast((8 * frame.dpi + 48) / 96);
         title_rect.left += text_padding;
         title_rect.right = close_rect.left - text_padding;
         _ = DrawTextW(
             dc,
-            title.ptr,
-            @intCast(title.len),
+            frame.titles.items[i].ptr,
+            @intCast(frame.titles.items[i].len),
             &title_rect,
-            0x1 | 0x4 | 0x20 | 0x800 | 0x8000, // CENTER | VCENTER | SINGLELINE | NOPREFIX | END_ELLIPSIS
+            0x1 | 0x4 | 0x20 | 0x800 | 0x8000,
         );
     }
 }

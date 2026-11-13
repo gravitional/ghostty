@@ -150,8 +150,11 @@ application log in the temporary directory if a check fails.
 
 ## Known gaps
 
-- Split layouts currently use equally sized rows and columns. Resizing split
-  dividers and arbitrary nested split layouts are not yet implemented.
+- Split layouts support dragging the divider to resize panes. The current divider position is shared across the frame, and arbitrary nested split layouts are not implemented.
+- The tab strip scrolls overflowing tabs with left and right controls, keeps
+  the active tab visible, and reserves a fixed `+` button at the right edge.
+  The desktop regression test covers scrolling, tab closing, and both `+`
+  button actions while the strip overflows.
 - Window titles update from the shell, but shells that report a title only
   through the console API (rather than OSC) are not covered.
 - Window movement and layout were tested on two monitors at 100% and 150%
@@ -159,9 +162,10 @@ application log in the temporary directory if a check fails.
   manual validation.
 - No Windows-specific default key bindings are provided; configure shortcuts in
   the config file as you would on any other platform.
-- The tab bar cannot be observed well enough from outside the process to assert
-  tab operations, so the smoke test does not cover them. Closing a tab and
-  closing from the tab bar were verified by hand.
+- The desktop regression script covers tab creation and overflow interactions,
+  split resizing, DPI changes, caption controls, window sizing, and normal
+  process exit. Some shell and platform-specific behaviors still need manual
+  validation.
 
 ## Measuring geometry
 

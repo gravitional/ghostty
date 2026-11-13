@@ -315,20 +315,58 @@ try {
     Assert 'Ctrl+Shift+Tab wraps to last tab' (Wait-Until { [GhosttyChrome]::Find($process.Id, 'GhosttyWin32') -ne $original })
     $shell.SendKeys('^+w')
     Assert 'Ctrl+Shift+W closes tab' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq 1 })
-    $r = [GhosttyChrome]::Bounds($original)
     $point = New-Object GhosttyChrome+Point
+    $bar = [GhosttyChrome]::Find($process.Id, 'GhosttyTabBar')
+    $barBounds = [GhosttyChrome]::Bounds($bar)
     $dpi = [GhosttyChrome]::GetDpiForWindow($frame)
-    $point.X = $r.Left + [int](184 * $dpi / 96)
-    $point.Y = $r.Top - [int](14 * $dpi / 96)
-    $bar = [GhosttyChrome]::WindowFromPoint($point)
+    $point.X = $barBounds.Right - [int](14 * $dpi / 96)
+    $point.Y = [int](($barBounds.Top + $barBounds.Bottom) / 2)
     [GhosttyChrome]::Click($point, $bar)
     Assert 'plus button creates tab' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq 2 })
-    $r = [GhosttyChrome]::Bounds($original)
-    $point.X = $r.Left + [int](2 * 170 * $dpi / 96 + 10 * $dpi / 96)
+
+    [GhosttyChrome]::SetWindowPos($frame, [IntPtr]::Zero, $initialBounds.Left, $initialBounds.Top, 430, 520, 0x14) | Out-Null
+    Start-Sleep -Milliseconds 500
+    for ($i = 0; $i -lt 6; $i++) {
+        $expected = [GhosttyChrome]::Count($process.Id) + 1
+        $shell.SendKeys('^+t')
+        Assert "overflow tab $($i + 1) created" (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq $expected })
+    }
+    $bar = [GhosttyChrome]::Find($process.Id, 'GhosttyTabBar')
+    $barBounds = [GhosttyChrome]::Bounds($bar)
+    $point.X = $barBounds.Left + [int](14 * $dpi / 96)
+    $point.Y = [int](($barBounds.Top + $barBounds.Bottom) / 2)
+    $lastPane = [GhosttyChrome]::Find($process.Id, 'GhosttyWin32')
+    for ($i = 0; $i -lt 8; $i++) { [GhosttyChrome]::Click($point, $bar) }
+    $point.X = $barBounds.Left + [int](76 * $dpi / 96)
+    [GhosttyChrome]::Click($point, $bar)
+    Assert 'scroll left reaches first tab' (Wait-Until { [GhosttyChrome]::Focused($frame) -eq $original })
+    $point.X = $barBounds.Left + [int](42 * $dpi / 96)
+    for ($i = 0; $i -lt 8; $i++) { [GhosttyChrome]::Click($point, $bar) }
+    $tabWidth = [int][Math]::Floor((170 * $dpi + 48) / 96)
+    $buttonWidth = [int][Math]::Floor((28 * $dpi + 48) / 96)
+    $capacity = [Math]::Max(1, [int][Math]::Floor(($barBounds.Right - $barBounds.Left - 3 * $buttonWidth) / $tabWidth))
+    $point.X = $barBounds.Left + 2 * $buttonWidth + ($capacity - 1) * $tabWidth + 20
+    [GhosttyChrome]::Click($point, $bar)
+    Assert 'scroll right reaches last tab' (Wait-Until { [GhosttyChrome]::Focused($frame) -eq $lastPane })
+    $point.X = $barBounds.Left + 2 * $buttonWidth + $capacity * $tabWidth - 10
+    $expected = [GhosttyChrome]::Count($process.Id) - 1
+    [GhosttyChrome]::Click($point, $bar)
+    Assert 'overflow tab close button works' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq $expected })
+
+    $barBounds = [GhosttyChrome]::Bounds($bar)
+    $point.X = $barBounds.Right - [int](14 * $dpi / 96)
+    $expected = [GhosttyChrome]::Count($process.Id) + 1
+    [GhosttyChrome]::Click($point, $bar)
+    Assert 'plus remains accessible with overflowing tabs' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq $expected })
+    $barBounds = [GhosttyChrome]::Bounds($bar)
+    $point.X = $barBounds.Right - [int](14 * $dpi / 96)
     [GhosttyChrome]::RightClick($point)
-    Assert 'right-click plus opens shell menu' (Wait-Until { [GhosttyChrome]::Find($process.Id, '#32768') -ne [IntPtr]::Zero })
+    Assert 'right-click fixed plus opens shell menu' (Wait-Until { [GhosttyChrome]::Find($process.Id, '#32768') -ne [IntPtr]::Zero })
+    $expected = [GhosttyChrome]::Count($process.Id) + 1
     $shell.SendKeys('n{ENTER}')
-    Assert 'shell menu creates Nushell tab' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq 3 })
+    Assert 'shell menu creates Nushell tab while overflowing' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq $expected })
+    [GhosttyChrome]::SetWindowPos($frame, [IntPtr]::Zero, $initialBounds.Left, $initialBounds.Top, $initialBounds.Right - $initialBounds.Left, $initialBounds.Bottom - $initialBounds.Top, 0x14) | Out-Null
+    Start-Sleep -Milliseconds 500
     Focus-Pane
     [GhosttyChrome]::Click([GhosttyChrome]::HitPoint($frame, 9), $frame)
     Assert 'caption maximize after terminal focus' (Wait-Until { [GhosttyChrome]::IsZoomed($frame) })
