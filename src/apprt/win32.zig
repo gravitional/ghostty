@@ -274,6 +274,13 @@ const IpcTag = enum(u32) {
     new_tab = 2,
 };
 
+const CANDIDATEFORM = extern struct {
+    index: DWORD = 0,
+    style: DWORD = 0x80, // CFS_EXCLUDE
+    position: POINT,
+    area: RECT,
+};
+extern "imm32" fn ImmSetCandidateWindow(hIMC: HIMC, form: *const CANDIDATEFORM) callconv(.c) BOOL;
 extern "imm32" fn ImmGetContext(hWnd: HWND) callconv(.c) ?HIMC;
 extern "imm32" fn ImmReleaseContext(hWnd: HWND, hIMC: HIMC) callconv(.c) BOOL;
 extern "imm32" fn ImmGetCompositionStringW(
@@ -315,6 +322,24 @@ extern "gdi32" fn StretchDIBits(
 ) callconv(.c) c_int;
 
 extern "gdi32" fn GetStockObject(i: c_int) callconv(.c) ?HANDLE;
+const LOGFONTW = extern struct {
+    height: i32,
+    width: i32,
+    escapement: i32,
+    orientation: i32,
+    weight: i32,
+    italic: u8,
+    underline: u8,
+    strikeout: u8,
+    charset: u8,
+    out_precision: u8,
+    clip_precision: u8,
+    quality: u8,
+    pitch: u8,
+    face: [32]u16,
+};
+extern "gdi32" fn GetObjectW(object: ?HANDLE, size: c_int, data: *anyopaque) callconv(.c) c_int;
+extern "gdi32" fn CreateFontIndirectW(font: *const LOGFONTW) callconv(.c) ?HANDLE;
 extern "gdi32" fn SelectObject(hdc: HDC, h: ?HANDLE) callconv(.c) ?HANDLE;
 extern "gdi32" fn DeleteObject(h: ?HANDLE) callconv(.c) BOOL;
 extern "gdi32" fn SetBkMode(hdc: HDC, mode: c_int) callconv(.c) c_int;
@@ -1023,11 +1048,24 @@ pub const Frame = struct {
     titles: std.ArrayListUnmanaged([]u16) = .empty,
     active: usize = 0,
 
+    dpi: u32 = 96,
+    tab_height: i32 = 28,
+    tab_width: i32 = 170,
+    close_width: i32 = 22,
+
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyFrame");
     const tab_class = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyTabBar");
-    const tab_height: i32 = 28;
-    const tab_width: i32 = 170;
-    const close_width: i32 = 22;
+
+    fn updateDpi(self: *Frame, dpi: u32) void {
+        self.dpi = @max(96, dpi);
+        self.tab_height = @intCast((28 * self.dpi + 48) / 96);
+        self.tab_width = @intCast((170 * self.dpi + 48) / 96);
+        self.close_width = @intCast((22 * self.dpi + 48) / 96);
+        const scale = @as(f64, @floatFromInt(self.dpi)) / base_dpi;
+        for (self.tabs.items) |tab| {
+            for (tab.panes.items) |pane| pane.updateContentScale(scale, scale);
+        }
+    }
 
     fn create(app: *App) !*Frame {
         const alloc = app.core_app.alloc;
@@ -1081,6 +1119,7 @@ pub const Frame = struct {
         ) orelse return error.WindowCreateFailed;
         _ = SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
+        self.updateDpi(GetDpiForWindow(self.hwnd));
         self.tab_bar = CreateWindowExW(
             0,
             tab_class,
@@ -1089,7 +1128,7 @@ pub const Frame = struct {
             0,
             0,
             win_w,
-            tab_height,
+            self.tab_height,
             self.hwnd,
             null,
             hinstance,
@@ -1108,7 +1147,7 @@ pub const Frame = struct {
             return .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         }
 
-        var origin = POINT{ .x = 0, .y = tab_height };
+        var origin = POINT{ .x = 0, .y = self.tab_height };
         if (ClientToScreen(self.hwnd, &origin) == 0) {
             return .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         }
@@ -1117,7 +1156,7 @@ pub const Frame = struct {
             .left = origin.x,
             .top = origin.y,
             .right = origin.x + (client.right - client.left),
-            .bottom = origin.y + (client.bottom - client.top - tab_height),
+            .bottom = origin.y + (client.bottom - client.top - self.tab_height),
         };
     }
 
@@ -1307,7 +1346,7 @@ pub const Frame = struct {
         var client: RECT = undefined;
         if (GetClientRect(self.hwnd, &client) == 0) return;
 
-        _ = MoveWindow(self.tab_bar, 0, 0, client.right, tab_height, 1);
+        _ = MoveWindow(self.tab_bar, 0, 0, client.right, self.tab_height, 1);
         self.layoutTab(self.active);
     }
 
@@ -1337,8 +1376,10 @@ pub const Frame = struct {
                     if (self.active >= self.tabs.items.len) self.active = self.tabs.items.len - 1;
                     self.selectTab(self.active);
                 } else {
+                    if (pi < tab.active) tab.active -= 1;
                     if (tab.active >= tab.panes.items.len) tab.active = tab.panes.items.len - 1;
                     self.layoutTab(ti);
+                    if (ti == self.active) self.selectPane(ti, tab.active);
                 }
 
                 _ = InvalidateRect(self.tab_bar, null, 1);
@@ -1474,6 +1515,16 @@ pub const Frame = struct {
 fn frameProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c) isize {
     const frame = frameFromWindow(hwnd);
     switch (msg) {
+        WM_DPICHANGED => {
+            if (frame) |f| {
+                f.updateDpi(@intCast(wParam & 0xFFFF));
+                const rect: *const RECT = @ptrFromInt(@as(usize, @bitCast(lParam)));
+                _ = SetWindowPos(hwnd, null, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, SWP_NOZORDER | 0x10);
+                f.layout();
+                _ = InvalidateRect(f.tab_bar, null, 1);
+            }
+            return 0;
+        },
         WM_SIZE, WM_MOVE => {
             if (frame) |f| f.layout();
             return 0;
@@ -1573,9 +1624,9 @@ fn tabBarProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
 
         WM_LBUTTONDOWN => {
             const x: i32 = @intCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-            const index = @divTrunc(x, Frame.tab_width);
-            const add_left = @as(i32, @intCast(frame.tabs.items.len)) * Frame.tab_width;
-            if (x >= add_left and x < add_left + Frame.tab_height) {
+            const index = @divTrunc(x, frame.tab_width);
+            const add_left = @as(i32, @intCast(frame.tabs.items.len)) * frame.tab_width;
+            if (x >= add_left and x < add_left + frame.tab_height) {
                 frame.app.addTab(frame, null) catch |err| {
                     log.err("new tab failed err={}", .{err});
                 };
@@ -1583,8 +1634,8 @@ fn tabBarProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
             }
             if (index >= 0 and index < frame.tabs.items.len) {
                 // The right edge of a tab is its close button.
-                const tab_right = (index + 1) * Frame.tab_width;
-                if (x >= tab_right - Frame.close_width) {
+                const tab_right = (index + 1) * frame.tab_width;
+                if (x >= tab_right - frame.close_width) {
                     frame.closeTab(@intCast(index));
                 } else {
                     frame.selectTab(@intCast(index));
@@ -1595,7 +1646,7 @@ fn tabBarProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
 
         WM_MBUTTONDOWN => {
             const x: i32 = @intCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-            const index = @divTrunc(x, Frame.tab_width);
+            const index = @divTrunc(x, frame.tab_width);
             if (index >= 0 and index < frame.tabs.items.len) {
                 frame.closeTab(@intCast(index));
             }
@@ -1622,16 +1673,25 @@ fn paintTabBar(frame: *Frame, hwnd: HWND) void {
         _ = DeleteObject(brush);
     }
 
-    const font = GetStockObject(17); // DEFAULT_GUI_FONT
-    const old_font = SelectObject(dc, font);
+    const default_font = GetStockObject(17); // DEFAULT_GUI_FONT
+    var font_info: LOGFONTW = undefined;
+    const scaled_font = font: {
+        if (GetObjectW(default_font, @sizeOf(LOGFONTW), &font_info) == 0) break :font null;
+        font_info.height = @divTrunc(font_info.height * @as(i32, @intCast(frame.dpi)), 96);
+        break :font CreateFontIndirectW(&font_info);
+    };
+    defer if (scaled_font) |font| {
+        _ = DeleteObject(font);
+    };
+    const old_font = SelectObject(dc, scaled_font orelse default_font);
     defer _ = SelectObject(dc, old_font);
     _ = SetBkMode(dc, 1); // TRANSPARENT
     _ = SetTextColor(dc, GetSysColor(18)); // COLOR_BTNTEXT
 
     var add_rect: RECT = .{
-        .left = @as(i32, @intCast(frame.tabs.items.len)) * Frame.tab_width,
+        .left = @as(i32, @intCast(frame.tabs.items.len)) * frame.tab_width,
         .top = 0,
-        .right = @as(i32, @intCast(frame.tabs.items.len)) * Frame.tab_width + Frame.tab_height,
+        .right = @as(i32, @intCast(frame.tabs.items.len)) * frame.tab_width + frame.tab_height,
         .bottom = client.bottom,
     };
     const add_label = std.unicode.utf8ToUtf16LeStringLiteral("+");
@@ -1639,9 +1699,9 @@ fn paintTabBar(frame: *Frame, hwnd: HWND) void {
 
     for (frame.titles.items, 0..) |title, i| {
         var rect: RECT = .{
-            .left = @as(i32, @intCast(i)) * Frame.tab_width,
+            .left = @as(i32, @intCast(i)) * frame.tab_width,
             .top = 0,
-            .right = @as(i32, @intCast(i + 1)) * Frame.tab_width,
+            .right = @as(i32, @intCast(i + 1)) * frame.tab_width,
             .bottom = client.bottom,
         };
 
@@ -1654,7 +1714,7 @@ fn paintTabBar(frame: *Frame, hwnd: HWND) void {
 
         // Close button: a small x at the right edge of the tab.
         var close_rect: RECT = .{
-            .left = rect.right - Frame.close_width,
+            .left = rect.right - frame.close_width,
             .top = 0,
             .right = rect.right,
             .bottom = client.bottom,
@@ -1670,8 +1730,9 @@ fn paintTabBar(frame: *Frame, hwnd: HWND) void {
 
         // Keep title text out of the close button's drawing and hit area.
         var title_rect = rect;
-        title_rect.left += 8;
-        title_rect.right = close_rect.left - 8;
+        const text_padding: i32 = @intCast((8 * frame.dpi + 48) / 96);
+        title_rect.left += text_padding;
+        title_rect.right = close_rect.left - text_padding;
         _ = DrawTextW(
             dc,
             title.ptr,
@@ -2116,6 +2177,21 @@ pub const Surface = struct {
         };
     }
 
+    fn updateImePosition(self: *Surface) void {
+        const himc = ImmGetContext(self.hwnd) orelse return;
+        defer _ = ImmReleaseContext(self.hwnd, himc);
+        // IMM expects client pixels, not logical points. The core already
+        // includes font scaling and terminal padding in these coordinates.
+        const pos = self.core_surface.imePointScaled(.{ .x = 1, .y = 1 });
+        const x: i32 = @intFromFloat(@floor(pos.x));
+        const y: i32 = @intFromFloat(@ceil(pos.y));
+        const form: CANDIDATEFORM = .{
+            .position = .{ .x = x, .y = y },
+            .area = .{ .left = x, .top = @intFromFloat(@floor(pos.y - pos.height)), .right = x + 1, .bottom = y },
+        };
+        _ = ImmSetCandidateWindow(himc, &form);
+    }
+
     /// Handle a WM_IME_COMPOSITION update.
     ///
     /// A committed result is inserted like pasted text; the remaining
@@ -2303,6 +2379,7 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
 
         WM_IME_STARTCOMPOSITION => {
             self.setPreedit("");
+            self.updateImePosition();
             return 0;
         },
 
@@ -2312,6 +2389,7 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
 
             const flags: DWORD = @truncate(@as(usize, @bitCast(lParam)));
             self.imeComposition(himc, flags);
+            self.updateImePosition();
             return 0;
         },
 
@@ -2352,6 +2430,9 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
         WM_CHAR, WM_SYSCHAR => return 0,
 
         WM_DPICHANGED => {
+            // Child panes are laid out by the frame, whose WM_DPICHANGED
+            // also updates every pane, including hidden tabs.
+            if (self.frame != null) return 0;
             const new_dpi: u32 = @intCast(wParam & 0xFFFF);
             const scale: f64 = @as(f64, @floatFromInt(new_dpi)) / base_dpi;
             self.updateContentScale(scale, scale);

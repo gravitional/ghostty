@@ -133,7 +133,7 @@ Notes for anyone extending it:
 ## Window chrome regression test
 
 `dist/windows/test-window-chrome.ps1` uses real mouse and keyboard input to
-check tab controls, caption buttons, resizing, Windows arrow shortcuts and
+check tab and basic split controls, caption buttons, resizing, Windows arrow shortcuts and
 closing a window with multiple tabs. It verifies that closing exits with code
 zero. It reads caption button bounds from Windows instead of assuming their
 positions from the window size.
@@ -142,16 +142,21 @@ positions from the window size.
 pwsh -NoProfile -File dist/windows/test-window-chrome.ps1
 ```
 
-Close existing Ghostty instances first, use an interactive desktop, and leave
-the mouse alone while the test runs. It restores the cursor position afterward
-and retains an application log in the temporary directory if a check fails.
+Close existing Ghostty instances first, use an unlocked interactive desktop,
+and leave the mouse and keyboard alone while the test runs. The test moves its
+window to each connected monitor and checks the tab bar and pane geometry at
+that monitor's DPI. It restores the cursor position afterward and retains an
+application log in the temporary directory if a check fails.
 
 ## Known gaps
 
+- Split layouts currently use equally sized rows and columns. Resizing split
+  dividers and arbitrary nested split layouts are not yet implemented.
 - Window titles update from the shell, but shells that report a title only
   through the console API (rather than OSC) are not covered.
-- Only a single 100%-scale display has been tested. Mixed-DPI setups and moving
-  a window between monitors with different scales are unverified.
+- Window movement and layout were tested on two monitors at 100% and 150%
+  scaling. Other scaling factors and IME candidate placement need further
+  manual validation.
 - No Windows-specific default key bindings are provided; configure shortcuts in
   the config file as you would on any other platform.
 - The tab bar cannot be observed well enough from outside the process to assert

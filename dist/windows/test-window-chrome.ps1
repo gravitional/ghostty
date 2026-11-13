@@ -26,6 +26,18 @@ public class GhosttyChrome {
         return count;
     }
     [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    public static void SplitArrow(byte vk) {
+        keybd_event(0x11, 0, 0, UIntPtr.Zero);
+        keybd_event(0x12, 0, 0, UIntPtr.Zero);
+        try {
+            keybd_event(vk, 0, 1, UIntPtr.Zero);
+            System.Threading.Thread.Sleep(100);
+            keybd_event(vk, 0, 3, UIntPtr.Zero);
+        } finally {
+            keybd_event(0x12, 0, 2, UIntPtr.Zero);
+            keybd_event(0x11, 0, 2, UIntPtr.Zero);
+        }
+    }
     public static void WinArrow(byte vk) {
         keybd_event(0x5B, 0, 1, UIntPtr.Zero);
         try {
@@ -33,6 +45,20 @@ public class GhosttyChrome {
             System.Threading.Thread.Sleep(100);
             keybd_event(vk, 0, 3, UIntPtr.Zero);
         } finally { keybd_event(0x5B, 0, 3, UIntPtr.Zero); }
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GuiInfo {
+        public uint Size, Flags;
+        public IntPtr Active, Focus, Capture, Menu, Move, Caret;
+        public Rect CaretRect;
+    }
+    [DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint thread, ref GuiInfo info);
+    public static IntPtr Focused(IntPtr frame) {
+        uint pid;
+        uint thread = GetWindowThreadProcessId(frame, out pid);
+        var info = new GuiInfo { Size = (uint)Marshal.SizeOf<GuiInfo>() };
+        if (!GetGUIThreadInfo(thread, ref info)) throw new Exception("Cannot read focused window");
+        return info.Focus;
     }
     public delegate bool EnumProc(IntPtr hwnd, IntPtr param);
     [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr hwnd, EnumProc cb, IntPtr param);
@@ -48,6 +74,15 @@ public class GhosttyChrome {
     [StructLayout(LayoutKind.Sequential)]
     public struct Point { public int X, Y; }
 
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int w, int h, uint flags);
+    public delegate bool MonitorProc(IntPtr monitor, IntPtr dc, ref Rect rect, IntPtr data);
+    [DllImport("user32.dll")] public static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MonitorProc callback, IntPtr data);
+    public static Rect[] Monitors() {
+        var result = new List<Rect>();
+        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (IntPtr m, IntPtr dc, ref Rect r, IntPtr data) => { result.Add(r); return true; }, IntPtr.Zero);
+        return result.ToArray();
+    }
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr param);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr hwnd, StringBuilder buf, int size);
@@ -199,9 +234,46 @@ try {
         [GhosttyChrome]::Click($point, $pane)
     }
 
+    $initialBounds = [GhosttyChrome]::Bounds($frame)
+    foreach ($monitor in [GhosttyChrome]::Monitors()) {
+        [GhosttyChrome]::SetWindowPos($frame, [IntPtr]::Zero, $monitor.Left + 60, $monitor.Top + 60, 800, 600, 0x14) | Out-Null
+        Start-Sleep -Milliseconds 800
+        $dpi = [GhosttyChrome]::GetDpiForWindow($frame)
+        $bar = [GhosttyChrome]::Find($process.Id, 'GhosttyTabBar')
+        $bounds = [GhosttyChrome]::Bounds($bar)
+        Assert "tab height at monitor $($monitor.Left),$($monitor.Top), DPI $dpi" (($bounds.Bottom - $bounds.Top) -eq [int][Math]::Floor((28 * $dpi + 48) / 96))
+        $pane = [GhosttyChrome]::Find($process.Id, 'GhosttyWin32')
+        $paneBounds = [GhosttyChrome]::Bounds($pane)
+        Assert 'pane sits directly below tab bar' ($paneBounds.Top -eq $bounds.Bottom)
+    }
+    [GhosttyChrome]::SetWindowPos($frame, [IntPtr]::Zero, $initialBounds.Left, $initialBounds.Top, $initialBounds.Right - $initialBounds.Left, $initialBounds.Bottom - $initialBounds.Top, 0x14) | Out-Null
+    Start-Sleep -Milliseconds 800
     Focus-Pane
     $shell = New-Object -ComObject WScript.Shell
     $original = [GhosttyChrome]::Find($process.Id, 'GhosttyWin32')
+    $shell.SendKeys('^+o')
+    Assert 'Ctrl+Shift+O creates right split' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq 2 })
+    Assert 'new split receives focus' (Wait-Until { $f = [GhosttyChrome]::Focused($frame); $f -ne [IntPtr]::Zero -and $f -ne $original })
+    $rightPane = [GhosttyChrome]::Focused($frame)
+    $leftBounds = [GhosttyChrome]::Bounds($original)
+    $rightBounds = [GhosttyChrome]::Bounds($rightPane)
+    Assert 'right split is adjacent to left pane' ($leftBounds.Right -eq $rightBounds.Left)
+    [GhosttyChrome]::SplitArrow(0x25)
+    Assert 'focus left split' (Wait-Until { [GhosttyChrome]::Focused($frame) -eq $original })
+    [GhosttyChrome]::SplitArrow(0x27)
+    Assert 'focus right split' (Wait-Until { [GhosttyChrome]::Focused($frame) -eq $rightPane })
+    $shell.SendKeys('exit{ENTER}')
+    Assert 'shell exit closes only its split' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq 1 })
+    Assert 'closing active split restores remaining pane focus' (Wait-Until { [GhosttyChrome]::Focused($frame) -eq $original })
+    $shell.SendKeys('^+e')
+    Assert 'Ctrl+Shift+E creates down split' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq 2 })
+    Assert 'down split receives focus' (Wait-Until { $f = [GhosttyChrome]::Focused($frame); $f -ne [IntPtr]::Zero -and $f -ne $original })
+    $bottomPane = [GhosttyChrome]::Focused($frame)
+    $topBounds = [GhosttyChrome]::Bounds($original)
+    $bottomBounds = [GhosttyChrome]::Bounds($bottomPane)
+    Assert 'down split is below original pane' ($topBounds.Bottom -eq $bottomBounds.Top)
+    $shell.SendKeys('exit{ENTER}')
+    Assert 'down split closes and restores focus' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq 1 -and [GhosttyChrome]::Focused($frame) -eq $original })
     $shell.SendKeys('^+t')
     Assert 'Ctrl+Shift+T creates tab' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq 2 })
     $shell.SendKeys('^{TAB}')
@@ -212,8 +284,9 @@ try {
     Assert 'Ctrl+Shift+W closes tab' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq 1 })
     $r = [GhosttyChrome]::Bounds($original)
     $point = New-Object GhosttyChrome+Point
-    $point.X = $r.Left + 184
-    $point.Y = $r.Top - 14
+    $dpi = [GhosttyChrome]::GetDpiForWindow($frame)
+    $point.X = $r.Left + [int](184 * $dpi / 96)
+    $point.Y = $r.Top - [int](14 * $dpi / 96)
     $bar = [GhosttyChrome]::WindowFromPoint($point)
     [GhosttyChrome]::Click($point, $bar)
     Assert 'plus button creates tab' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq 2 })
