@@ -91,6 +91,7 @@ public class GhosttyChrome {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr hwnd, StringBuilder buf, int size);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr hwnd, StringBuilder text, int max);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out Point point);
@@ -168,6 +169,13 @@ public class GhosttyChrome {
         throw new Exception("Cannot find non-client hit target " + hit);
     }
 
+    public static void RightClick(Point p) {
+        SetCursorPos(p.X, p.Y);
+        System.Threading.Thread.Sleep(100);
+        mouse_event(8, 0, 0, 0, UIntPtr.Zero);
+        System.Threading.Thread.Sleep(80);
+        mouse_event(16, 0, 0, 0, UIntPtr.Zero);
+    }
     public static void Click(Point p, IntPtr expected) {
         if (WindowFromPoint(p) != expected) throw new Exception("Test window is obscured");
         SetCursorPos(p.X, p.Y);
@@ -296,6 +304,12 @@ try {
     $bar = [GhosttyChrome]::WindowFromPoint($point)
     [GhosttyChrome]::Click($point, $bar)
     Assert 'plus button creates tab' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq 2 })
+    $r = [GhosttyChrome]::Bounds($original)
+    $point.X = $r.Left + [int](2 * 170 * $dpi / 96 + 10 * $dpi / 96)
+    [GhosttyChrome]::RightClick($point)
+    Assert 'right-click plus opens shell menu' (Wait-Until { [GhosttyChrome]::Find($process.Id, '#32768') -ne [IntPtr]::Zero })
+    $shell.SendKeys('n{ENTER}')
+    Assert 'shell menu creates Nushell tab' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq 3 })
     Focus-Pane
     [GhosttyChrome]::Click([GhosttyChrome]::HitPoint($frame, 9), $frame)
     Assert 'caption maximize after terminal focus' (Wait-Until { [GhosttyChrome]::IsZoomed($frame) })

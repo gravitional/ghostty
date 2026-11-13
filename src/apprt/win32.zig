@@ -108,6 +108,7 @@ const BITMAPINFO = extern struct {
 };
 
 extern "kernel32" fn GetModuleHandleW(lpModuleName: ?LPCWSTR) callconv(.c) ?HINSTANCE;
+extern "kernel32" fn SearchPathW(path: ?LPCWSTR, file_name: LPCWSTR, extension: ?LPCWSTR, buffer_len: DWORD, buffer: [*]u16, file_part: ?*?[*]u16) callconv(.c) DWORD;
 
 extern "user32" fn RegisterClassExW(lpwcx: *const WNDCLASSEXW) callconv(.c) ATOM;
 extern "user32" fn CreateWindowExW(
@@ -129,6 +130,11 @@ extern "user32" fn DestroyWindow(hWnd: HWND) callconv(.c) BOOL;
 extern "user32" fn ShowWindow(hWnd: HWND, nCmdShow: c_int) callconv(.c) BOOL;
 extern "user32" fn UpdateWindow(hWnd: HWND) callconv(.c) BOOL;
 extern "user32" fn ScreenToClient(hWnd: HWND, point: *POINT) callconv(.c) BOOL;
+extern "user32" fn GetCursorPos(point: *POINT) callconv(.c) BOOL;
+extern "user32" fn CreatePopupMenu() callconv(.c) ?HMENU;
+extern "user32" fn AppendMenuW(menu: HMENU, flags: UINT, id: usize, text: LPCWSTR) callconv(.c) BOOL;
+extern "user32" fn TrackPopupMenu(menu: HMENU, flags: UINT, x: c_int, y: c_int, reserved: c_int, hwnd: HWND, rect: ?*const RECT) callconv(.c) UINT;
+extern "user32" fn DestroyMenu(menu: HMENU) callconv(.c) BOOL;
 extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.c) BOOL;
 extern "user32" fn GetDC(hWnd: ?HWND) callconv(.c) ?HDC;
 extern "user32" fn ReleaseDC(hWnd: ?HWND, hDC: HDC) callconv(.c) c_int;
@@ -395,6 +401,9 @@ const WM_LBUTTONDOWN: UINT = 0x0201;
 const WM_LBUTTONUP: UINT = 0x0202;
 const WM_RBUTTONDOWN: UINT = 0x0204;
 const WM_RBUTTONUP: UINT = 0x0205;
+const MF_STRING: UINT = 0x0000;
+const TPM_RIGHTBUTTON: UINT = 0x0002;
+const TPM_RETURNCMD: UINT = 0x0100;
 const WM_MBUTTONDOWN: UINT = 0x0207;
 const WM_MBUTTONUP: UINT = 0x0208;
 const WM_MOUSEWHEEL: UINT = 0x020A;
@@ -653,10 +662,9 @@ pub const App = struct {
         // Show the frame before creating its first pane so the popup is
         // positioned and visible from the moment GL starts presenting.
         _ = ShowWindow(frame.hwnd, SW_SHOW);
-        _ = ShowWindow(frame.hwnd, SW_SHOW);
         _ = UpdateWindow(frame.hwnd);
 
-        try self.addTab(frame, working_directory);
+        try self.addTab(frame, working_directory, null);
 
         // WM_SIZE can arrive while the window is still being created, before
         // the frame pointer is attached, so lay out once explicitly to size
@@ -677,9 +685,9 @@ pub const App = struct {
     }
 
     /// Add a tab (with one pane) to `frame` and focus it.
-    fn addTab(self: *App, frame: *Frame, working_directory: ?[]const u8) !void {
+    fn addTab(self: *App, frame: *Frame, working_directory: ?[]const u8, command: ?[]const u8) !void {
         try frame.addTab();
-        _ = try self.createPane(frame, frame.tabs.items.len - 1, working_directory, .right);
+        _ = try self.createPane(frame, frame.tabs.items.len - 1, working_directory, .right, command);
     }
 
     /// Add a pane to an existing tab.
@@ -689,6 +697,7 @@ pub const App = struct {
         tab_index: usize,
         working_directory: ?[]const u8,
         direction: apprt.action.SplitDirection,
+        command: ?[]const u8,
     ) !*Surface {
         const alloc = self.core_app.alloc;
 
@@ -699,6 +708,7 @@ pub const App = struct {
             .owner = frame.hwnd,
             .rect = frame.contentRect(),
             .working_directory = working_directory,
+            .command = command,
         });
         errdefer alloc.destroy(surface);
 
@@ -819,7 +829,7 @@ pub const App = struct {
             .new_tab => {
                 if (self.frames.items.len > 0) {
                     const frame = self.frames.items[self.frames.items.len - 1];
-                    self.addTab(frame, directory) catch |err| {
+                    self.addTab(frame, directory, null) catch |err| {
                         log.err("failed to open tab for IPC err={}", .{err});
                     };
                 }
@@ -864,7 +874,7 @@ pub const App = struct {
                     else
                         null,
                 };
-                if (frame) |f| try self.addTab(f, null);
+                if (frame) |f| try self.addTab(f, null, null);
                 return frame != null;
             },
 
@@ -894,7 +904,7 @@ pub const App = struct {
                 const frame = if (surface) |surf| surf.frame else null;
                 if (frame) |f| {
                     const index = f.tabIndex(surface.?) orelse f.active;
-                    _ = try self.createPane(f, index, null, value);
+                    _ = try self.createPane(f, index, null, value, null);
                     return true;
                 }
                 return false;
@@ -1627,6 +1637,30 @@ fn frameProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c)
 }
 
 /// Draws the tab strip and switches tabs on click.
+const ID_SHELL_NU: usize = 1;
+const ID_SHELL_PWSH: usize = 2;
+const ID_SHELL_POWERSHELL: usize = 3;
+
+fn showShellMenu(frame: *Frame, hwnd: HWND) void {
+    const menu = CreatePopupMenu() orelse return;
+    defer _ = DestroyMenu(menu);
+    _ = AppendMenuW(menu, MF_STRING, ID_SHELL_NU, std.unicode.utf8ToUtf16LeStringLiteral("Nushell").ptr);
+    _ = AppendMenuW(menu, MF_STRING, ID_SHELL_PWSH, std.unicode.utf8ToUtf16LeStringLiteral("PowerShell 7").ptr);
+    _ = AppendMenuW(menu, MF_STRING, ID_SHELL_POWERSHELL, std.unicode.utf8ToUtf16LeStringLiteral("Windows PowerShell").ptr);
+    var point: POINT = undefined;
+    if (GetCursorPos(&point) == 0) return;
+    const selected = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, null);
+    const command: ?[]const u8 = switch (selected) {
+        ID_SHELL_NU => "direct:nu.exe",
+        ID_SHELL_PWSH => "direct:pwsh.exe -NoLogo",
+        ID_SHELL_POWERSHELL => "direct:powershell.exe -NoLogo",
+        else => null,
+    };
+    if (command) |cmd| frame.app.addTab(frame, null, cmd) catch |err| {
+        log.err("failed to create shell tab err={}", .{err});
+    };
+}
+
 fn tabBarProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c) isize {
     const frame = frameFromWindow(hwnd) orelse
         return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -1644,7 +1678,7 @@ fn tabBarProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
             const index = @divTrunc(x, frame.tab_width);
             const add_left = @as(i32, @intCast(frame.tabs.items.len)) * frame.tab_width;
             if (x >= add_left and x < add_left + frame.tab_height) {
-                frame.app.addTab(frame, null) catch |err| {
+                frame.app.addTab(frame, null, null) catch |err| {
                     log.err("new tab failed err={}", .{err});
                 };
                 return 0;
@@ -1659,6 +1693,15 @@ fn tabBarProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
                 }
             }
             return 0;
+        },
+
+        WM_RBUTTONUP => {
+            const x: i32 = @intCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
+            const add_left = @as(i32, @intCast(frame.tabs.items.len)) * frame.tab_width;
+            if (x >= add_left and x < add_left + frame.tab_height) {
+                showShellMenu(frame, hwnd);
+                return 0;
+            }
         },
 
         WM_MBUTTONDOWN => {
@@ -1819,6 +1862,7 @@ pub const Surface = struct {
     pub const Options = struct {
         working_directory: ?[]const u8 = null,
         font_size: f32 = 0,
+        command: ?[]const u8 = null,
 
         /// Parent window for a tab or split pane. Presentation uses GDI,
         /// so the terminal can be a child while the frame stays active.
@@ -1938,6 +1982,12 @@ pub const Surface = struct {
                 self.working_directory = owned;
                 config.@"working-directory" = .{ .path = owned };
             } else |_| {}
+        }
+
+        if (opts.command) |command_text| {
+            var command: Config.Command = undefined;
+            try command.parseCLI(config.arenaAlloc(), command_text);
+            config.command = command;
         }
 
         try self.core_surface.init(
