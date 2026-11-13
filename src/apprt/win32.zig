@@ -1245,6 +1245,7 @@ pub const Frame = struct {
         if (rows == 0) return;
 
         const row_height = @divTrunc(rect.bottom - rect.top, @as(i32, @intCast(rows)));
+        const divider: i32 = @intCast(@max(1, (self.dpi + 48) / 96));
         for (starts[0..rows], ends[0..rows], 0..) |row_start, row_end, row| {
             const count = row_end - row_start;
             if (count == 0) continue;
@@ -1259,11 +1260,13 @@ pub const Frame = struct {
                 placePane(pane, .{
                     .left = left,
                     .top = top,
-                    .right = right,
-                    .bottom = bottom,
+                    .right = if (col + 1 < count) @max(left, right - divider) else right,
+                    .bottom = if (row + 1 < rows) @max(top, bottom - divider) else bottom,
                 });
             }
         }
+        // Repaint exposed gaps after panes have moved or been removed.
+        _ = InvalidateRect(self.hwnd, null, 0);
     }
 
     /// Enter or leave borderless fullscreen: the window loses its frame and
@@ -1515,6 +1518,19 @@ pub const Frame = struct {
 fn frameProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c) isize {
     const frame = frameFromWindow(hwnd);
     switch (msg) {
+        WM_ERASEBKGND => return 1,
+        WM_PAINT => {
+            var ps: PAINTSTRUCT = undefined;
+            const dc = BeginPaint(hwnd, &ps);
+            if (dc) |hdc| {
+                if (CreateSolidBrush(GetSysColor(16))) |brush| { // COLOR_BTNSHADOW
+                    _ = FillRect(hdc, &ps.rcPaint, brush);
+                    _ = DeleteObject(brush);
+                }
+            }
+            _ = EndPaint(hwnd, &ps);
+            return 0;
+        },
         WM_DPICHANGED => {
             if (frame) |f| {
                 f.updateDpi(@intCast(wParam & 0xFFFF));
