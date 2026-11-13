@@ -174,6 +174,7 @@ extern "user32" fn SetWindowPos(
     uFlags: UINT,
 ) callconv(.c) BOOL;
 extern "user32" fn SetProcessDpiAwarenessContext(value: ?*anyopaque) callconv(.c) BOOL;
+extern "user32" fn MessageBoxW(hwnd: ?HWND, text: [*:0]const u16, caption: [*:0]const u16, flags: UINT) callconv(.c) c_int;
 extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.c) UINT;
 extern "user32" fn GetSystemMetrics(nIndex: c_int) callconv(.c) c_int;
 extern "user32" fn SendMessageW(hWnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c) LRESULT;
@@ -2008,18 +2009,37 @@ pub const Surface = struct {
         defer alloc.free(text);
 
         const available = [_][]const u8{"text/plain"};
-        self.core_surface.completeClipboardRequest(state, .{
+        var complete: CoreSurface.CompleteClipboard = .{
             .contents = &.{.{ .mime = "text/plain", .data = text }},
             .available = &available,
-            // TODO: surface Ghostty's unsafe-paste confirmation before
-            // treating every paste as confirmed.
-            .confirmed = true,
-        }) catch |err| {
-            log.warn("clipboard completion failed err={}", .{err});
-            return .unsupported;
+            .confirmed = false,
+        };
+        self.core_surface.completeClipboardRequest(state, complete) catch |err| {
+            switch (err) {
+                error.UnsafePaste, error.UnauthorizedPaste => {
+                    const message = if (err == error.UnsafePaste)
+                        "This paste contains content that may execute commands. Paste anyway?"
+                    else
+                        "Allow the terminal application to read the clipboard?";
+                    if (!self.confirmClipboard(message)) {
+                        self.core_surface.denyClipboardRequest(state);
+                        return .started;
+                    }
+                    complete.confirmed = true;
+                    try self.core_surface.completeClipboardRequest(state, complete);
+                },
+                else => return err,
+            }
         };
 
         return .started;
+    }
+
+    fn confirmClipboard(self: *Surface, message: []const u8) bool {
+        const wide = std.unicode.utf8ToUtf16LeAllocZ(self.app.core_app.alloc, message) catch return false;
+        defer self.app.core_app.alloc.free(wide);
+        // Yes/No, warning icon, and No selected by default.
+        return MessageBoxW(self.hwnd, wide.ptr, std.unicode.utf8ToUtf16LeStringLiteral("Ghostty clipboard"), 0x104 | 0x30) == 6;
     }
 
     pub fn setClipboard(
@@ -2028,8 +2048,8 @@ pub const Surface = struct {
         contents: []const apprt.ClipboardContent,
         confirm: bool,
     ) !void {
-        _ = confirm;
         if (clipboard_type != .standard) return;
+        if (confirm and !self.confirmClipboard("Allow the terminal application to replace the clipboard contents?")) return;
 
         const alloc = self.app.core_app.alloc;
         for (contents) |content| {

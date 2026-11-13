@@ -1,7 +1,10 @@
 # Real mouse regression checks for frame activation, caption buttons and sizing.
 # Run on an interactive desktop without moving the mouse during the test.
 # Unlike posting WM_SYSCOMMAND, these clicks exercise non-client activation.
-param([string]$Exe = (Join-Path $PSScriptRoot '..\..\zig-out\bin\ghostty.exe'))
+param(
+    [string]$Exe = (Join-Path $PSScriptRoot '..\..\zig-out\bin\ghostty.exe'),
+    [switch]$LibraryOnly
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -201,6 +204,8 @@ function Assert([string]$Name, [bool]$Ok) {
     if (-not $Ok) { throw "FAIL: $Name" }
     Write-Host "PASS: $Name"
 }
+
+if ($LibraryOnly) { return }
 
 # Single-instance IPC would otherwise send this test's actions to an existing
 # session. Refuse to run rather than interfere with the user's terminal.

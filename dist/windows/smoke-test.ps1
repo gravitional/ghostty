@@ -138,7 +138,7 @@ $extraKeybinds = @(
     'keybind = f9=new_split:right',
     'keybind = f5=close_surface',
     'keybind = f11=toggle_fullscreen',
-    'keybind = f4=paste_from_clipboard`nkeybind = f8=scroll_page_up'
+    'keybind = f4=paste_from_clipboard', 'keybind = f8=scroll_page_up'
 )
 
 function Wait-Until {
