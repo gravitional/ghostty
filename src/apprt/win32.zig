@@ -841,6 +841,24 @@ pub const App = struct {
                 return frame != null;
             },
 
+            .goto_tab => {
+                const frame = self.targetFrame(target) orelse return false;
+                const count = frame.tabs.items.len;
+                if (count == 0) return false;
+                const index: usize = switch (value) {
+                    .previous => (frame.active + count - 1) % count,
+                    .next => (frame.active + 1) % count,
+                    .last => count - 1,
+                    else => blk: {
+                        const number = @backingInt(value);
+                        if (number <= 0 or number > count) return false;
+                        break :blk @intCast(number - 1);
+                    },
+                };
+                frame.selectTab(index);
+                return true;
+            },
+
             .new_split => {
                 const surface: ?*Surface = switch (target) {
                     .surface => |surface| surface.rt_surface,
@@ -1548,6 +1566,13 @@ fn tabBarProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
         WM_LBUTTONDOWN => {
             const x: i32 = @intCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
             const index = @divTrunc(x, Frame.tab_width);
+            const add_left = @as(i32, @intCast(frame.tabs.items.len)) * Frame.tab_width;
+            if (x >= add_left and x < add_left + Frame.tab_height) {
+                frame.app.addTab(frame, null) catch |err| {
+                    log.err("new tab failed err={}", .{err});
+                };
+                return 0;
+            }
             if (index >= 0 and index < frame.tabs.items.len) {
                 // The right edge of a tab is its close button.
                 const tab_right = (index + 1) * Frame.tab_width;
@@ -1594,6 +1619,15 @@ fn paintTabBar(frame: *Frame, hwnd: HWND) void {
     defer _ = SelectObject(dc, old_font);
     _ = SetBkMode(dc, 1); // TRANSPARENT
     _ = SetTextColor(dc, GetSysColor(18)); // COLOR_BTNTEXT
+
+    var add_rect: RECT = .{
+        .left = @as(i32, @intCast(frame.tabs.items.len)) * Frame.tab_width,
+        .top = 0,
+        .right = @as(i32, @intCast(frame.tabs.items.len)) * Frame.tab_width + Frame.tab_height,
+        .bottom = client.bottom,
+    };
+    const add_label = std.unicode.utf8ToUtf16LeStringLiteral("+");
+    _ = DrawTextW(dc, add_label.ptr, 1, &add_rect, 0x1 | 0x4 | 0x20);
 
     for (frame.titles.items, 0..) |title, i| {
         var rect: RECT = .{
@@ -2015,6 +2049,7 @@ pub const Surface = struct {
             .action = action,
             .key = keyFromVk(vk, extended),
             .mods = mods,
+            .unshifted_codepoint = unshiftedCodepoint(vk),
             // Shift is consumed when it changed the produced character.
             .consumed_mods = .{ .shift = mods.shift and text.len > 0 },
             .utf8 = text,
@@ -2515,6 +2550,19 @@ fn keyFromVk(vk: u32, extended: bool) input.Key {
     }
 
     return .unidentified;
+}
+
+/// Resolve the layout's base character even when Ctrl/Alt suppress text.
+/// Flag 4 prevents this lookup from changing Windows' dead-key state.
+fn unshiftedCodepoint(vk: u32) u21 {
+    const state: [256]u8 = @splat(0);
+    var wide: [8]u16 = undefined;
+    const n = ToUnicodeEx(vk, MapVirtualKeyW(vk, 0), &state, &wide, wide.len, 4, null);
+    if (n <= 0) return 0;
+    var it = std.unicode.Utf16LeIterator.init(wide[0..@intCast(n)]);
+    const cp = it.nextCodepoint() catch return 0;
+    if ((it.nextCodepoint() catch return 0) != null) return 0;
+    return cp orelse 0;
 }
 
 /// The UTF-8 text produced by pressing `vk` with the given modifiers.

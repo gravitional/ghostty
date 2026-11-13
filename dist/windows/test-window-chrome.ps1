@@ -13,6 +13,18 @@ using System.Runtime.InteropServices;
 using System.Text;
 
 public class GhosttyChrome {
+    public static int Count(int pid) {
+        int count = 0;
+        EnumWindows((hwnd, param) => {
+            uint owner;
+            GetWindowThreadProcessId(hwnd, out owner);
+            var name = new StringBuilder(128);
+            GetClassNameW(hwnd, name, name.Capacity);
+            if (owner == pid && name.ToString() == "GhosttyWin32") count++;
+            return true;
+        }, IntPtr.Zero);
+        return count;
+    }
     public delegate bool EnumProc(IntPtr hwnd, IntPtr param);
     [StructLayout(LayoutKind.Sequential)]
     public struct Rect { public int Left, Top, Right, Bottom; }
@@ -170,6 +182,24 @@ try {
         [GhosttyChrome]::Click($point, $pane)
     }
 
+    Focus-Pane
+    $shell = New-Object -ComObject WScript.Shell
+    $original = [GhosttyChrome]::Find($process.Id, 'GhosttyWin32')
+    $shell.SendKeys('^+t')
+    Assert 'Ctrl+Shift+T creates tab' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq 2 })
+    $shell.SendKeys('^{TAB}')
+    Assert 'Ctrl+Tab wraps to first tab' (Wait-Until { [GhosttyChrome]::Find($process.Id, 'GhosttyWin32') -eq $original })
+    $shell.SendKeys('^+{TAB}')
+    Assert 'Ctrl+Shift+Tab wraps to last tab' (Wait-Until { [GhosttyChrome]::Find($process.Id, 'GhosttyWin32') -ne $original })
+    $shell.SendKeys('^+w')
+    Assert 'Ctrl+Shift+W closes tab' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq 1 })
+    $r = [GhosttyChrome]::Bounds($original)
+    $point = New-Object GhosttyChrome+Point
+    $point.X = $r.Left + 184
+    $point.Y = $r.Top - 14
+    $bar = [GhosttyChrome]::WindowFromPoint($point)
+    [GhosttyChrome]::Click($point, $bar)
+    Assert 'plus button creates tab' (Wait-Until { [GhosttyChrome]::Count($process.Id) -eq 2 })
     Focus-Pane
     [GhosttyChrome]::Click([GhosttyChrome]::HitPoint($frame, 9), $frame)
     Assert 'caption maximize after terminal focus' (Wait-Until { [GhosttyChrome]::IsZoomed($frame) })
