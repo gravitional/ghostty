@@ -51,15 +51,17 @@ cadence.
 These are the decisions that took the most iteration. Read them before changing
 the Windows runtime.
 
-### A window is a frame plus popup panes
+### A window is a frame plus child panes
 
-`Frame` is a real top-level window that also draws the tab strip. Every pane is
-a `WS_POPUP | WS_EX_TOOLWINDOW` window **owned** by its frame, with its own GL
-device.
+`Frame` is the top-level window and draws the tab strip. Each terminal pane is
+created as a `WS_CHILD` window. This keeps the frame active when the terminal
+has keyboard focus, allowing Windows to apply its window management shortcuts
+to the frame. Pane positions are converted from screen to frame coordinates.
 
-`WS_CHILD` windows with `SetParent` never presented a frame, so panes cannot be
-children. The price is manual layout and the fact that raising the frame hides
-its own popups; when capturing a screenshot, raise the *pane*, not the frame.
+An earlier WGL presentation experiment used owned popup panes because direct
+presentation to child windows failed. The current GDI presentation path works
+with child windows; enabling direct WGL presentation would require revisiting
+that constraint.
 
 ### Presentation is a CPU copy, not WGL
 
@@ -130,10 +132,11 @@ Notes for anyone extending it:
 
 ## Window chrome regression test
 
-`dist/windows/test-window-chrome.ps1` uses real mouse input to check maximize,
-restore, minimize, border resizing, and closing a window with multiple tabs.
-It verifies that closing exits with code zero. It reads caption button bounds
-from Windows instead of assuming their positions from the window size.
+`dist/windows/test-window-chrome.ps1` uses real mouse and keyboard input to
+check tab controls, caption buttons, resizing, Windows arrow shortcuts and
+closing a window with multiple tabs. It verifies that closing exits with code
+zero. It reads caption button bounds from Windows instead of assuming their
+positions from the window size.
 
 ```powershell
 pwsh -NoProfile -File dist/windows/test-window-chrome.ps1
@@ -144,9 +147,6 @@ the mouse alone while the test runs. It restores the cursor position afterward
 and retains an application log in the temporary directory if a check fails.
 
 ## Known gaps
-
-- Windows shortcuts such as Win+Left/Right/Up/Down do not currently arrange the
-  frame as expected while a terminal pane is active. This remains follow-up work.
 
 - Window titles update from the shell, but shells that report a title only
   through the console API (rather than OSC) are not covered.

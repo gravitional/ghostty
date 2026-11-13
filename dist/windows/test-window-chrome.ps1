@@ -15,7 +15,7 @@ using System.Text;
 public class GhosttyChrome {
     public static int Count(int pid) {
         int count = 0;
-        EnumWindows((hwnd, param) => {
+        AllWindows((hwnd, param) => {
             uint owner;
             GetWindowThreadProcessId(hwnd, out owner);
             var name = new StringBuilder(128);
@@ -25,7 +25,24 @@ public class GhosttyChrome {
         }, IntPtr.Zero);
         return count;
     }
+    [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    public static void WinArrow(byte vk) {
+        keybd_event(0x5B, 0, 1, UIntPtr.Zero);
+        try {
+            keybd_event(vk, 0, 1, UIntPtr.Zero);
+            System.Threading.Thread.Sleep(100);
+            keybd_event(vk, 0, 3, UIntPtr.Zero);
+        } finally { keybd_event(0x5B, 0, 3, UIntPtr.Zero); }
+    }
     public delegate bool EnumProc(IntPtr hwnd, IntPtr param);
+    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr hwnd, EnumProc cb, IntPtr param);
+    public static bool AllWindows(EnumProc cb, IntPtr param) {
+        return EnumWindows((hwnd, p) => {
+            cb(hwnd, p);
+            EnumChildWindows(hwnd, cb, p);
+            return true;
+        }, param);
+    }
     [StructLayout(LayoutKind.Sequential)]
     public struct Rect { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)]
@@ -49,7 +66,7 @@ public class GhosttyChrome {
 
     public static IntPtr Find(int pid, string cls) {
         IntPtr found = IntPtr.Zero;
-        EnumWindows((hwnd, param) => {
+        AllWindows((hwnd, param) => {
             uint owner;
             GetWindowThreadProcessId(hwnd, out owner);
             var name = new StringBuilder(128);
@@ -173,7 +190,7 @@ try {
 
     function Focus-Pane {
         $pane = [GhosttyChrome]::Find($process.Id, 'GhosttyWin32')
-        [GhosttyChrome]::SetForegroundWindow($pane) | Out-Null
+        [GhosttyChrome]::SetForegroundWindow($frame) | Out-Null
         Start-Sleep -Milliseconds 200
         $r = [GhosttyChrome]::Bounds($pane)
         $point = New-Object GhosttyChrome+Point
@@ -219,6 +236,33 @@ try {
     Assert 'caption minimize after terminal focus' (Wait-Until { [GhosttyChrome]::IsIconic($frame) })
     [GhosttyChrome]::ShowWindow($frame, 9) | Out-Null
     Assert 'restore after minimize' (Wait-Until { -not [GhosttyChrome]::IsIconic($frame) })
+
+    Focus-Pane
+    [GhosttyChrome]::WinArrow(0x26)
+    Assert 'Win+Up maximizes focused terminal frame' (Wait-Until { [GhosttyChrome]::IsZoomed($frame) })
+    [GhosttyChrome]::WinArrow(0x28)
+    Assert 'Win+Down restores frame' (Wait-Until { -not [GhosttyChrome]::IsZoomed($frame) })
+    Start-Sleep -Milliseconds 500
+    $beforeSnap = [GhosttyChrome]::Bounds($frame)
+    [GhosttyChrome]::WinArrow(0x25)
+    Assert 'Win+Left snaps frame' (Wait-Until {
+        $r = [GhosttyChrome]::Bounds($frame)
+        $r.Left -ne $beforeSnap.Left -and ($r.Right - $r.Left) -ne ($beforeSnap.Right - $beforeSnap.Left)
+    })
+    # Escape dismisses Snap Assist without choosing another application.
+    Start-Sleep -Milliseconds 500
+    $shell.SendKeys('{ESC}')
+    Focus-Pane
+    [GhosttyChrome]::WinArrow(0x27)
+    Start-Sleep -Milliseconds 500
+    [GhosttyChrome]::WinArrow(0x27)
+    Assert 'Win+Right snaps frame to right' (Wait-Until {
+        $r = [GhosttyChrome]::Bounds($frame)
+        $r.Left -gt $beforeSnap.Left
+    })
+    $shell.SendKeys('{ESC}')
+    [GhosttyChrome]::ShowWindow($frame, 9) | Out-Null
+    Start-Sleep -Milliseconds 500
 
     # Exercise closing a frame with multiple tabs as well as a live shell.
     $ipc = Start-Process -FilePath (Resolve-Path $Exe).Path -ArgumentList '+new-tab' -PassThru

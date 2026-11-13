@@ -128,6 +128,7 @@ extern "user32" fn DefWindowProcW(hWnd: HWND, msg: UINT, wParam: WPARAM, lParam:
 extern "user32" fn DestroyWindow(hWnd: HWND) callconv(.c) BOOL;
 extern "user32" fn ShowWindow(hWnd: HWND, nCmdShow: c_int) callconv(.c) BOOL;
 extern "user32" fn UpdateWindow(hWnd: HWND) callconv(.c) BOOL;
+extern "user32" fn ScreenToClient(hWnd: HWND, point: *POINT) callconv(.c) BOOL;
 extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.c) BOOL;
 extern "user32" fn GetDC(hWnd: ?HWND) callconv(.c) ?HDC;
 extern "user32" fn ReleaseDC(hWnd: ?HWND, hDC: HDC) callconv(.c) c_int;
@@ -1000,10 +1001,9 @@ pub const Tab = struct {
 
 /// A window hosting one or more tabbed terminal surfaces.
 ///
-/// The frame owns the tab strip (drawn by us) and the popup windows that
-/// make up the tab contents. Panes are top-level popups owned by the frame
-/// rather than `WS_CHILD` windows because WGL only presents reliably on
-/// top-level windows.
+/// The frame owns the tab strip and child terminal panes. Child windows
+/// keep the frame active while a pane has keyboard focus, so Windows can
+/// apply native window management shortcuts to the frame.
 pub const Frame = struct {
     app: *App,
     hwnd: HWND,
@@ -1526,11 +1526,19 @@ fn frameProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c)
             return 0;
         },
 
-        // Panes are owned top-level windows, not children. Forwarding
-        // WM_SETFOCUS to a pane would reactivate it while Windows begins
-        // a caption button click or border drag, cancelling that operation.
-        // Restore terminal focus on keyboard input instead. This also lets
-        // typing resume after restoring or moving the frame.
+        // Child focus leaves the frame active, including during caption
+        // operations. Restore terminal input when the frame is reactivated.
+        WM_SETFOCUS => {
+            if (frame) |f| {
+                if (f.active < f.tabs.items.len) {
+                    const tab = &f.tabs.items[f.active];
+                    if (tab.active < tab.panes.items.len)
+                        _ = SetFocus(tab.panes.items[tab.active].hwnd);
+                }
+            }
+            return 0;
+        },
+
         WM_KEYDOWN, WM_SYSKEYDOWN => {
             if (frame) |f| {
                 if (f.active < f.tabs.items.len) {
@@ -1681,10 +1689,12 @@ fn toggleMaximize(frame: *Frame) void {
 }
 
 fn placePane(surface: *Surface, rect: RECT) void {
+    var origin = POINT{ .x = rect.left, .y = rect.top };
+    _ = ScreenToClient(surface.frame.?.hwnd, &origin);
     _ = MoveWindow(
         surface.hwnd,
-        rect.left,
-        rect.top,
+        origin.x,
+        origin.y,
         @max(0, rect.right - rect.left),
         @max(0, rect.bottom - rect.top),
         1,
@@ -1732,14 +1742,11 @@ pub const Surface = struct {
         working_directory: ?[]const u8 = null,
         font_size: f32 = 0,
 
-        /// When set, the surface is created as an owned popup window of
-        /// this window instead of as a standalone window. Tabs use this:
-        /// WGL presents reliably on top-level windows, but not on
-        /// `WS_CHILD` windows, so tab content is a real popup positioned
-        /// over the host window.
+        /// Parent window for a tab or split pane. Presentation uses GDI,
+        /// so the terminal can be a child while the frame stays active.
         owner: ?HWND = null,
 
-        /// Screen rectangle for the popup, when `owner` is set.
+        /// Screen rectangle for the pane, when `owner` is set.
         rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
     };
 
@@ -1776,19 +1783,21 @@ pub const Surface = struct {
         const pos_x = @max(0, @divTrunc(GetSystemMetrics(0) - win_w, 2));
         const pos_y = @max(0, @divTrunc(GetSystemMetrics(1) - win_h, 2));
 
-        const hwnd = if (opts.owner) |owner| popup: {
+        const hwnd = if (opts.owner) |owner| child: {
             self.size = .{
                 .width = @intCast(@max(0, opts.rect.right - opts.rect.left)),
                 .height = @intCast(@max(0, opts.rect.bottom - opts.rect.top)),
             };
 
-            break :popup CreateWindowExW(
-                WS_EX_TOOLWINDOW,
+            var origin = POINT{ .x = opts.rect.left, .y = opts.rect.top };
+            _ = ScreenToClient(owner, &origin);
+            break :child CreateWindowExW(
+                0,
                 class_name,
                 std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
-                WS_POPUP | WS_VISIBLE,
-                opts.rect.left,
-                opts.rect.top,
+                WS_CHILD | WS_VISIBLE,
+                origin.x,
+                origin.y,
                 @intCast(self.size.width),
                 @intCast(self.size.height),
                 owner,
@@ -1835,9 +1844,8 @@ pub const Surface = struct {
             self.content_scale = .{ .x = scale, .y = scale };
         }
 
-        // Frames are presented by the renderer itself through WGL
-        // SwapBuffers; GDI below is only the fallback for when the renderer
-        // cannot present to the window.
+        // The renderer exports pixels for GDI presentation in this runtime.
+        // This works for child panes without activating a separate window.
 
         // Register with the core before initializing so that callbacks can
         // find us.
@@ -2241,6 +2249,14 @@ fn windowProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c
         },
 
         WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_XBUTTONDOWN => {
+            _ = SetFocus(hwnd);
+            if (self.frame) |frame| {
+                if (frame.tabIndex(self)) |index| {
+                    for (frame.tabs.items[index].panes.items, 0..) |pane, i| {
+                        if (pane == self) frame.tabs.items[index].active = i;
+                    }
+                }
+            }
             const p = mousePos(lParam);
             self.cursorPosCallback(p.x, p.y);
 
