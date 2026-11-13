@@ -16,6 +16,14 @@ A file for [guiding coding agents](https://agents.md/).
 - **Formatting (Swift)**: `swiftlint lint --strict --fix`
 - **Formatting (other)**: `prettier -w .`
 
+## Windows fork guidance
+
+- The root [README.md](README.md) describes this personal `windows-port` fork in Chinese. The upstream README snapshot is archived at `docs/README-upstream.md`.
+- Windows build instructions: `docs/windows-build-zh.md`. Runtime architecture, tested behavior, and known gaps: `dist/windows/README.md`.
+- Native Win32 runtime changes belong primarily in `src/apprt/win32.zig`. Preserve existing core behavior and keep fork-specific changes focused on the Windows runtime.
+- Build with `zig build`. For Windows desktop changes, run the applicable real-desktop regression scripts under `dist/windows/`; tests require an unlocked interactive desktop and may change cursor, clipboard, configuration, or window state. Close existing Ghostty instances first and do not overwrite an executable that is still running; use a separate `--prefix` when needed.
+- Keep documentation accurate about current implementation. In particular, split divider positions are currently shared per frame rather than stored independently for each divider.
+
 ## libghostty-vt
 
 - Build: `zig build -Demit-lib-vt`
