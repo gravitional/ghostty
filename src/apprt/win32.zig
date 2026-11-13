@@ -1046,10 +1046,14 @@ pub const Tab = struct {
 /// apply native window management shortcuts to the frame.
 const SplitDrag = struct {
     vertical: bool,
+    first: *Surface,
+    second: *Surface,
+    total_weight: f64,
     start: i32,
     original: i32,
     min: i32,
     max: i32,
+    extent: i32,
 };
 
 pub const Frame = struct {
@@ -1072,7 +1076,6 @@ pub const Frame = struct {
     active: usize = 0,
     tab_scroll: usize = 0,
     split_drag: ?SplitDrag = null,
-    split_position: ?i32 = null,
     dpi: u32 = 96,
     tab_height: i32 = 28,
     tab_width: i32 = 170,
@@ -1208,6 +1211,7 @@ pub const Frame = struct {
 
     fn selectTab(self: *Frame, index: usize) void {
         if (index >= self.tabs.items.len) return;
+        self.endSplitDrag();
         self.active = index;
         self.ensureActiveTabVisible();
 
@@ -1279,39 +1283,71 @@ pub const Frame = struct {
         _ = InvalidateRect(self.tab_bar, null, 1);
     }
 
+    fn startsRow(tab: *const Tab, index: usize) bool {
+        return index == 0 or tab.dirs.items[index] == .down or tab.dirs.items[index] == .up;
+    }
+
+    fn rowEnd(tab: *const Tab, start: usize) usize {
+        var end = start + 1;
+        while (end < tab.panes.items.len and !startsRow(tab, end)) : (end += 1) {}
+        return end;
+    }
+
     fn splitAt(self: *Frame, x: i32, y: i32) ?SplitDrag {
         if (self.active >= self.tabs.items.len) return null;
         const tab = &self.tabs.items[self.active];
-        const rect = self.contentRect();
-        const gap = @max(3, @as(i32, @intCast((self.dpi + 48) / 96)) + 2);
-        const usable_w = rect.right - rect.left;
-        const usable_h = rect.bottom - rect.top;
-        if (tab.panes.items.len < 2) return null;
-
-        var row_count: usize = 1;
-        for (tab.dirs.items[1..]) |direction| {
-            if (direction == .down or direction == .up) {
-                row_count += 1;
-                if (@abs(y - (rect.top + @divTrunc(usable_h * @as(i32, @intCast(row_count - 1)), @as(i32, @intCast(row_count))))) <= gap) {
-                    const pos = y - rect.top;
-                    return .{ .vertical = false, .start = y, .original = pos, .min = split_min_size, .max = usable_h - split_min_size };
+        var point = POINT{ .x = x, .y = y };
+        if (ClientToScreen(self.hwnd, &point) == 0) return null;
+        const content = self.contentRect();
+        const divider: i32 = @intCast(@max(1, (self.dpi + 48) / 96));
+        var start: usize = 0;
+        while (start < tab.panes.items.len) {
+            const end = rowEnd(tab, start);
+            const first_rect = paneRect(tab.panes.items[start]) orelse return null;
+            if (end < tab.panes.items.len) {
+                const second_rect = paneRect(tab.panes.items[end]) orelse return null;
+                if (point.x >= content.left and point.x < content.right and
+                    point.y >= first_rect.bottom - divider - 3 and point.y < second_rect.top + 3)
+                {
+                    const second_end = rowEnd(tab, end);
+                    const bottom = second_rect.bottom + @as(i32, if (second_end < tab.panes.items.len) divider else 0);
+                    return self.makeSplitDrag(false, tab.panes.items[start], tab.panes.items[end], y, second_rect.top - first_rect.top, bottom - first_rect.top);
                 }
             }
-        }
-        var col_count: usize = 1;
-        for (tab.dirs.items[1..]) |direction| {
-            if (direction == .right or direction == .left) col_count += 1;
-        }
-        if (col_count > 1) {
-            const boundary = rect.left + @divTrunc(usable_w, @as(i32, @intCast(col_count)));
-            if (@abs(x - boundary) <= gap) return .{ .vertical = true, .start = x, .original = boundary - rect.left, .min = split_min_size, .max = usable_w - split_min_size };
+            for (start..end - 1) |i| {
+                const left = paneRect(tab.panes.items[i]) orelse return null;
+                const right = paneRect(tab.panes.items[i + 1]) orelse return null;
+                if (point.y >= left.top and point.y < left.bottom and
+                    point.x >= left.right - divider - 3 and point.x < right.left + 3)
+                {
+                    const edge = right.right + @as(i32, if (i + 2 < end) divider else 0);
+                    return self.makeSplitDrag(true, tab.panes.items[i], tab.panes.items[i + 1], x, right.left - left.left, edge - left.left);
+                }
+            }
+            start = end;
         }
         return null;
     }
 
+    fn makeSplitDrag(self: *Frame, vertical: bool, first: *Surface, second: *Surface, start: i32, original: i32, extent: i32) ?SplitDrag {
+        if (extent < 2) return null;
+        const scaled_minimum = @as(u32, @intCast(split_min_size)) * self.dpi + 48;
+        const minimum = @min(@divTrunc(extent, 2), @as(i32, @intCast(@divTrunc(scaled_minimum, 96))));
+        return .{
+            .vertical = vertical,
+            .first = first,
+            .second = second,
+            .total_weight = if (vertical) first.split_width + second.split_width else first.split_height + second.split_height,
+            .start = start,
+            .original = original,
+            .min = minimum,
+            .max = extent - minimum,
+            .extent = extent,
+        };
+    }
+
     fn beginSplitDrag(self: *Frame, x: i32, y: i32) bool {
-        const drag = self.splitAt(x, y) orelse return false;
-        self.split_drag = drag;
+        self.split_drag = self.splitAt(x, y) orelse return false;
         _ = SetCapture(self.hwnd);
         return true;
     }
@@ -1319,11 +1355,20 @@ pub const Frame = struct {
     fn updateSplitDrag(self: *Frame, x: i32, y: i32) void {
         const drag = self.split_drag orelse return;
         const delta = if (drag.vertical) x - drag.start else y - drag.start;
-        self.split_position = @max(drag.min, @min(drag.max, drag.original + delta));
+        const size = @max(drag.min, @min(drag.max, drag.original + delta));
+        const weight = drag.total_weight * @as(f64, @floatFromInt(size)) / @as(f64, @floatFromInt(drag.extent));
+        if (drag.vertical) {
+            drag.first.split_width = weight;
+            drag.second.split_width = drag.total_weight - weight;
+        } else {
+            drag.first.split_height = weight;
+            drag.second.split_height = drag.total_weight - weight;
+        }
         self.layoutTab(self.active);
     }
 
     fn endSplitDrag(self: *Frame) void {
+        if (self.split_drag == null) return;
         self.split_drag = null;
         _ = ReleaseCapture();
     }
@@ -1331,59 +1376,44 @@ pub const Frame = struct {
     fn layoutTab(self: *Frame, index: usize) void {
         if (index >= self.tabs.items.len) return;
         const rect = self.contentRect();
-
         const tab = &self.tabs.items[index];
         const panes = tab.panes.items;
         if (panes.len == 0) return;
 
-        // Panes are grouped into rows: a pane that was split downwards or
-        // upwards starts a new row, and every other pane joins the row
-        // before it. Rows share the height, panes in a row share the width.
-        var starts: [64]usize = undefined;
-        var ends: [64]usize = undefined;
-        var rows: usize = 0;
-        for (panes, 0..) |_, i| {
-            const starts_row = i == 0 or switch (tab.dirs.items[i]) {
-                .down, .up => true,
-                else => false,
-            };
-
-            if (starts_row) {
-                if (rows >= starts.len) break;
-                starts[rows] = i;
-                ends[rows] = i + 1;
-                rows += 1;
-            } else {
-                ends[rows - 1] = i + 1;
-            }
+        // Row heights and pane widths have independent weights. Changing two
+        // adjacent weights preserves every other boundary and tab's layout.
+        var total_height: f64 = 0;
+        for (panes, 0..) |pane, i| {
+            if (startsRow(tab, i)) total_height += pane.split_height;
         }
-        if (rows == 0) return;
-
-        const row_height = @divTrunc(rect.bottom - rect.top, @as(i32, @intCast(rows)));
+        const height: f64 = @floatFromInt(@max(0, rect.bottom - rect.top));
+        const width: f64 = @floatFromInt(@max(0, rect.right - rect.left));
         const divider: i32 = @intCast(@max(1, (self.dpi + 48) / 96));
-        for (starts[0..rows], ends[0..rows], 0..) |row_start, row_end, row| {
-            const count = row_end - row_start;
-            if (count == 0) continue;
-
-            const top = rect.top + @as(i32, @intCast(row)) * row_height;
-            const bottom = if (row == rows - 1) rect.bottom else top + row_height;
-            const row_split = self.split_position orelse @divTrunc(rect.bottom - rect.top, @as(i32, @intCast(rows)));
-            const row_top = if (row == 0) rect.top else rect.top + @as(i32, @intCast(row)) * row_split;
-            const row_bottom = if (row == rows - 1) rect.bottom else row_top + row_split;
-            for (panes[row_start..row_end], 0..) |pane, col| {
-                const col_split = self.split_position orelse @divTrunc(rect.right - rect.left, @as(i32, @intCast(count)));
-                const col_left = if (col == 0) rect.left else rect.left + @as(i32, @intCast(col)) * col_split;
-                const col_right = if (col == count - 1) rect.right else col_left + col_split;
+        var start: usize = 0;
+        var top = rect.top;
+        var used_height: f64 = 0;
+        while (start < panes.len) {
+            const end = rowEnd(tab, start);
+            used_height += panes[start].split_height;
+            const bottom = rect.top + @as(i32, @intFromFloat(@round(height * used_height / total_height)));
+            var total_width: f64 = 0;
+            for (panes[start..end]) |pane| total_width += pane.split_width;
+            var left = rect.left;
+            var used_width: f64 = 0;
+            for (panes[start..end], start..) |pane, i| {
+                used_width += pane.split_width;
+                const right = rect.left + @as(i32, @intFromFloat(@round(width * used_width / total_width)));
                 placePane(pane, .{
-                    .left = col_left,
-                    .top = row_top,
-                    .right = if (col + 1 < count) @max(col_left, col_right - divider) else col_right,
-                    .bottom = if (row + 1 < rows) @max(row_top, row_bottom - divider) else row_bottom,
+                    .left = left,
+                    .top = top,
+                    .right = if (i + 1 < end) @max(left, right - divider) else right,
+                    .bottom = if (end < panes.len) @max(top, bottom - divider) else bottom,
                 });
+                left = right;
             }
-            _ = bottom;
+            top = bottom;
+            start = end;
         }
-        // Repaint exposed gaps after panes have moved or been removed.
         _ = InvalidateRect(self.hwnd, null, 0);
     }
 
@@ -1479,6 +1509,12 @@ pub const Frame = struct {
         for (self.tabs.items, 0..) |*tab, ti| {
             for (tab.panes.items, 0..) |pane, pi| {
                 if (pane != surface) continue;
+                self.endSplitDrag();
+                // When a row leader closes, keep its row and height intact.
+                if (startsRow(tab, pi) and pi + 1 < tab.panes.items.len and !startsRow(tab, pi + 1)) {
+                    tab.dirs.items[pi + 1] = tab.dirs.items[pi];
+                    tab.panes.items[pi + 1].split_height = pane.split_height;
+                }
 
                 _ = tab.panes.orderedRemove(pi);
                 if (pi < tab.dirs.items.len) _ = tab.dirs.orderedRemove(pi);
@@ -1639,6 +1675,10 @@ pub const Frame = struct {
 fn frameProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c) isize {
     const frame = frameFromWindow(hwnd);
     switch (msg) {
+        0x0215, 0x001F => { // WM_CAPTURECHANGED, WM_CANCELMODE
+            if (frame) |f| f.endSplitDrag();
+            return 0;
+        },
         WM_MOUSEMOVE => {
             if (frame) |f| {
                 const coordinates: usize = @bitCast(lParam);
@@ -1981,6 +2021,9 @@ fn frameFromWindow(hwnd: HWND) ?*Frame {
 }
 
 pub const Surface = struct {
+    /// Width within a row and height when this pane starts a row.
+    split_width: f64 = 1,
+    split_height: f64 = 1,
     app: *App,
 
     /// Host window this surface is a tab of, when it has one.
