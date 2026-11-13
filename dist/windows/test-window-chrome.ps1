@@ -185,6 +185,18 @@ public class GhosttyChrome {
         mouse_event(4, 0, 0, 0, UIntPtr.Zero);
     }
 
+    public static void DragTo(Point p, int dx, int dy) {
+        SetCursorPos(p.X, p.Y);
+        mouse_event(2, 0, 0, 0, UIntPtr.Zero);
+        try {
+            System.Threading.Thread.Sleep(100);
+            for (int i = 1; i <= 12; i++) {
+                SetCursorPos(p.X + dx * i / 12, p.Y + dy * i / 12);
+                System.Threading.Thread.Sleep(25);
+            }
+        } finally { mouse_event(4, 0, 0, 0, UIntPtr.Zero); }
+    }
+
     public static void Drag(Point p) {
         SetCursorPos(p.X, p.Y);
         mouse_event(2, 0, 0, 0, UIntPtr.Zero);
@@ -272,6 +284,13 @@ try {
     $rightBounds = [GhosttyChrome]::Bounds($rightPane)
     $divider = [Math]::Max(1, [int][Math]::Floor(([GhosttyChrome]::GetDpiForWindow($frame) + 48) / 96))
     Assert 'right split has a DPI-scaled divider' ($rightBounds.Left - $leftBounds.Right -eq $divider)
+    $splitPoint = New-Object GhosttyChrome+Point
+    $splitPoint.X = [int](($leftBounds.Right + $rightBounds.Left) / 2)
+    $splitPoint.Y = [int](($leftBounds.Top + $leftBounds.Bottom) / 2)
+    [GhosttyChrome]::DragTo($splitPoint, 100, 0)
+    $leftBounds = [GhosttyChrome]::Bounds($original)
+    $rightBounds = [GhosttyChrome]::Bounds($rightPane)
+    Assert 'dragging vertical divider resizes panes' ($rightBounds.Left - $leftBounds.Right -eq $divider -and ($leftBounds.Right - $leftBounds.Left) -gt 400)
     [GhosttyChrome]::SplitArrow(0x25)
     Assert 'focus left split' (Wait-Until { [GhosttyChrome]::Focused($frame) -eq $original })
     [GhosttyChrome]::SplitArrow(0x27)

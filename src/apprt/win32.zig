@@ -296,7 +296,9 @@ extern "imm32" fn ImmGetCompositionStringW(
     lpBuf: ?*anyopaque,
     dwBufLen: DWORD,
 ) callconv(.c) i32;
+extern "user32" fn SetCursor(hCursor: ?HCURSOR) callconv(.c) ?HCURSOR;
 extern "user32" fn SetCapture(hWnd: HWND) callconv(.c) ?HWND;
+extern "user32" fn ReleaseCapture() callconv(.c) BOOL;
 extern "user32" fn OpenClipboard(hWndNewOwner: ?HWND) callconv(.c) BOOL;
 extern "user32" fn CloseClipboard() callconv(.c) BOOL;
 extern "user32" fn EmptyClipboard() callconv(.c) BOOL;
@@ -306,8 +308,7 @@ extern "kernel32" fn GlobalAlloc(uFlags: UINT, dwBytes: usize) callconv(.c) ?HAN
 extern "kernel32" fn GlobalLock(hMem: HANDLE) callconv(.c) ?*anyopaque;
 extern "kernel32" fn GlobalUnlock(hMem: HANDLE) callconv(.c) BOOL;
 extern "kernel32" fn GlobalFree(hMem: HANDLE) callconv(.c) ?HANDLE;
-extern "user32" fn ReleaseCapture() callconv(.c) BOOL;
-extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: LPCWSTR) callconv(.c) ?HCURSOR;
+extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: [*:0]align(1) const u16) callconv(.c) ?HCURSOR;
 extern "user32" fn AdjustWindowRectEx(lpRect: *RECT, dwStyle: DWORD, bMenu: BOOL, dwExStyle: DWORD) callconv(.c) BOOL;
 extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.c) BOOL;
 extern "user32" fn IsZoomed(hWnd: HWND) callconv(.c) BOOL;
@@ -435,6 +436,9 @@ const SW_SHOW: c_int = 5;
 const SW_HIDE: c_int = 0;
 const GWLP_USERDATA: c_int = -21;
 const IDC_ARROW: LPCWSTR = @ptrFromInt(32512);
+const IDC_SIZEWE: LPCWSTR = @ptrFromInt(32644);
+const IDC_SIZENS: [*:0]align(1) const u16 = @ptrFromInt(32645);
+const split_min_size: i32 = 64;
 const SRCCOPY: DWORD = 0x00CC_0020;
 
 const WM_IME_SETCONTEXT: UINT = 0x0281;
@@ -1040,6 +1044,14 @@ pub const Tab = struct {
 /// The frame owns the tab strip and child terminal panes. Child windows
 /// keep the frame active while a pane has keyboard focus, so Windows can
 /// apply native window management shortcuts to the frame.
+const SplitDrag = struct {
+    vertical: bool,
+    start: i32,
+    original: i32,
+    min: i32,
+    max: i32,
+};
+
 pub const Frame = struct {
     app: *App,
     hwnd: HWND,
@@ -1058,7 +1070,8 @@ pub const Frame = struct {
     /// Tab labels, UTF-16 so they can be drawn without conversion.
     titles: std.ArrayListUnmanaged([]u16) = .empty,
     active: usize = 0,
-
+    split_drag: ?SplitDrag = null,
+    split_position: ?i32 = null,
     dpi: u32 = 96,
     tab_height: i32 = 28,
     tab_width: i32 = 170,
@@ -1223,7 +1236,55 @@ pub const Frame = struct {
         _ = InvalidateRect(self.tab_bar, null, 1);
     }
 
-    /// Lay the panes of one tab out inside the content rectangle.
+    fn splitAt(self: *Frame, x: i32, y: i32) ?SplitDrag {
+        if (self.active >= self.tabs.items.len) return null;
+        const tab = &self.tabs.items[self.active];
+        const rect = self.contentRect();
+        const gap = @max(3, @as(i32, @intCast((self.dpi + 48) / 96)) + 2);
+        const usable_w = rect.right - rect.left;
+        const usable_h = rect.bottom - rect.top;
+        if (tab.panes.items.len < 2) return null;
+
+        var row_count: usize = 1;
+        for (tab.dirs.items[1..]) |direction| {
+            if (direction == .down or direction == .up) {
+                row_count += 1;
+                if (@abs(y - (rect.top + @divTrunc(usable_h * @as(i32, @intCast(row_count - 1)), @as(i32, @intCast(row_count))))) <= gap) {
+                    const pos = y - rect.top;
+                    return .{ .vertical = false, .start = y, .original = pos, .min = split_min_size, .max = usable_h - split_min_size };
+                }
+            }
+        }
+        var col_count: usize = 1;
+        for (tab.dirs.items[1..]) |direction| {
+            if (direction == .right or direction == .left) col_count += 1;
+        }
+        if (col_count > 1) {
+            const boundary = rect.left + @divTrunc(usable_w, @as(i32, @intCast(col_count)));
+            if (@abs(x - boundary) <= gap) return .{ .vertical = true, .start = x, .original = boundary - rect.left, .min = split_min_size, .max = usable_w - split_min_size };
+        }
+        return null;
+    }
+
+    fn beginSplitDrag(self: *Frame, x: i32, y: i32) bool {
+        const drag = self.splitAt(x, y) orelse return false;
+        self.split_drag = drag;
+        _ = SetCapture(self.hwnd);
+        return true;
+    }
+
+    fn updateSplitDrag(self: *Frame, x: i32, y: i32) void {
+        const drag = self.split_drag orelse return;
+        const delta = if (drag.vertical) x - drag.start else y - drag.start;
+        self.split_position = @max(drag.min, @min(drag.max, drag.original + delta));
+        self.layoutTab(self.active);
+    }
+
+    fn endSplitDrag(self: *Frame) void {
+        self.split_drag = null;
+        _ = ReleaseCapture();
+    }
+
     fn layoutTab(self: *Frame, index: usize) void {
         if (index >= self.tabs.items.len) return;
         const rect = self.contentRect();
@@ -1263,18 +1324,21 @@ pub const Frame = struct {
 
             const top = rect.top + @as(i32, @intCast(row)) * row_height;
             const bottom = if (row == rows - 1) rect.bottom else top + row_height;
-            const col_width = @divTrunc(rect.right - rect.left, @as(i32, @intCast(count)));
-
+            const row_split = self.split_position orelse @divTrunc(rect.bottom - rect.top, @as(i32, @intCast(rows)));
+            const row_top = if (row == 0) rect.top else rect.top + @as(i32, @intCast(row)) * row_split;
+            const row_bottom = if (row == rows - 1) rect.bottom else row_top + row_split;
             for (panes[row_start..row_end], 0..) |pane, col| {
-                const left = rect.left + @as(i32, @intCast(col)) * col_width;
-                const right = if (col == count - 1) rect.right else left + col_width;
+                const col_split = self.split_position orelse @divTrunc(rect.right - rect.left, @as(i32, @intCast(count)));
+                const col_left = if (col == 0) rect.left else rect.left + @as(i32, @intCast(col)) * col_split;
+                const col_right = if (col == count - 1) rect.right else col_left + col_split;
                 placePane(pane, .{
-                    .left = left,
-                    .top = top,
-                    .right = if (col + 1 < count) @max(left, right - divider) else right,
-                    .bottom = if (row + 1 < rows) @max(top, bottom - divider) else bottom,
+                    .left = col_left,
+                    .top = row_top,
+                    .right = if (col + 1 < count) @max(col_left, col_right - divider) else col_right,
+                    .bottom = if (row + 1 < rows) @max(row_top, row_bottom - divider) else row_bottom,
                 });
             }
+            _ = bottom;
         }
         // Repaint exposed gaps after panes have moved or been removed.
         _ = InvalidateRect(self.hwnd, null, 0);
@@ -1529,6 +1593,39 @@ pub const Frame = struct {
 fn frameProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c) isize {
     const frame = frameFromWindow(hwnd);
     switch (msg) {
+        WM_MOUSEMOVE => {
+            if (frame) |f| {
+                const coordinates: usize = @bitCast(lParam);
+                const x: i32 = @as(i16, @bitCast(@as(u16, @truncate(coordinates))));
+                const y: i32 = @as(i16, @bitCast(@as(u16, @truncate(coordinates >> 16))));
+                if (f.split_drag != null) {
+                    f.updateSplitDrag(x, y);
+                    return 0;
+                }
+                const cursor = if (f.splitAt(x, y)) |hit|
+                    LoadCursorW(null, if (hit.vertical) IDC_SIZEWE else IDC_SIZENS)
+                else
+                    LoadCursorW(null, IDC_ARROW);
+                _ = SetCursor(cursor);
+                return 0;
+            }
+        },
+        WM_LBUTTONDOWN => {
+            if (frame) |f| {
+                const coordinates: usize = @bitCast(lParam);
+                const x: i32 = @as(i16, @bitCast(@as(u16, @truncate(coordinates))));
+                const y: i32 = @as(i16, @bitCast(@as(u16, @truncate(coordinates >> 16))));
+                if (f.beginSplitDrag(x, y)) return 0;
+            }
+        },
+        WM_LBUTTONUP => {
+            if (frame) |f| {
+                if (f.split_drag != null) {
+                    f.endSplitDrag();
+                    return 0;
+                }
+            }
+        },
         WM_ERASEBKGND => return 1,
         WM_PAINT => {
             var ps: PAINTSTRUCT = undefined;
