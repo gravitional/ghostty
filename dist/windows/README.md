@@ -128,7 +128,25 @@ Notes for anyone extending it:
 - The process must be DPI aware (`SetProcessDpiAwarenessContext(-4)`) or every
   coordinate is off by the scale factor.
 
+## Window chrome regression test
+
+`dist/windows/test-window-chrome.ps1` uses real mouse input to check maximize,
+restore, minimize, border resizing, and closing a window with multiple tabs.
+It verifies that closing exits with code zero. It reads caption button bounds
+from Windows instead of assuming their positions from the window size.
+
+```powershell
+pwsh -NoProfile -File dist/windows/test-window-chrome.ps1
+```
+
+Close existing Ghostty instances first, use an interactive desktop, and leave
+the mouse alone while the test runs. It restores the cursor position afterward
+and retains an application log in the temporary directory if a check fails.
+
 ## Known gaps
+
+- Windows shortcuts such as Win+Left/Right/Up/Down do not currently arrange the
+  frame as expected while a terminal pane is active. This remains follow-up work.
 
 - Window titles update from the shell, but shells that report a title only
   through the console API (rather than OSC) are not covered.

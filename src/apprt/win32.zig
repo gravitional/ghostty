@@ -554,11 +554,17 @@ pub const App = struct {
     pub fn terminate(self: *App) void {
         if (self.keymap) |*v| v.deinit();
         const alloc = self.core_app.alloc;
+        // Retired surfaces still own renderer/IO threads and are registered
+        // with the core. Stop and unregister them before freeing their
+        // memory or the configurations those threads may reference.
+        for (self.retired_surfaces.items) |surface| {
+            surface.deinit();
+            alloc.destroy(surface);
+        }
+        self.retired_surfaces.deinit(alloc);
+
         for (self.retired_configs.items) |*retired| retired.deinit();
         self.retired_configs.deinit(alloc);
-
-        for (self.retired_surfaces.items) |surface| alloc.destroy(surface);
-        self.retired_surfaces.deinit(alloc);
 
         self.config.deinit();
         app_instance = null;
@@ -631,7 +637,7 @@ pub const App = struct {
         frame.layout();
 
         _ = SetForegroundWindow(frame.hwnd);
-        _ = SetFocus(frame.hwnd);
+        frame.selectTab(frame.active);
 
         // One timer drives the core tick for the whole process, so it is
         // owned by the main window.
@@ -710,10 +716,6 @@ pub const App = struct {
         }
 
         if (surface.frame) |frame| frame.removeSurface(surface);
-
-        if (surface.working_directory) |dir| alloc.free(dir);
-        if (surface.pixels.len > 0) alloc.free(surface.pixels);
-        if (surface.title) |title| alloc.free(title);
 
         self.retired_surfaces.append(alloc, surface) catch {
             // Nothing else to do: leaking the surface is better than freeing
@@ -1440,10 +1442,13 @@ pub const Frame = struct {
     }
 
     fn closeAll(self: *Frame) void {
-        // Ask the core to close each pane; a surface destroys its own
-        // window as it goes, and the last one destroys the frame.
-        for (self.tabs.items) |tab| {
-            for (tab.panes.items) |pane| pane.core_surface.close();
+        // Closing a pane synchronously removes it (and possibly its tab).
+        // Re-read the lists after each close rather than iterating slices
+        // that removeSurface mutates underneath us.
+        while (self.tabs.items.len > 0) {
+            const tab = &self.tabs.items[self.tabs.items.len - 1];
+            if (tab.panes.items.len == 0) break;
+            tab.panes.items[tab.panes.items.len - 1].core_surface.close();
         }
     }
 };
@@ -1503,12 +1508,22 @@ fn frameProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.c)
             return 0;
         },
 
-        WM_SETFOCUS => {
+        // Panes are owned top-level windows, not children. Forwarding
+        // WM_SETFOCUS to a pane would reactivate it while Windows begins
+        // a caption button click or border drag, cancelling that operation.
+        // Restore terminal focus on keyboard input instead. This also lets
+        // typing resume after restoring or moving the frame.
+        WM_KEYDOWN, WM_SYSKEYDOWN => {
             if (frame) |f| {
-                const tab = &f.tabs.items[f.active];
-                if (tab.panes.items.len > 0) _ = SetFocus(tab.panes.items[tab.active].hwnd);
+                if (f.active < f.tabs.items.len) {
+                    const tab = &f.tabs.items[f.active];
+                    if (tab.active < tab.panes.items.len) {
+                        const pane = tab.panes.items[tab.active];
+                        _ = SetFocus(pane.hwnd);
+                        return SendMessageW(pane.hwnd, msg, wParam, lParam);
+                    }
+                }
             }
-            return 0;
         },
 
         else => {},
@@ -1812,9 +1827,10 @@ pub const Surface = struct {
     }
 
     pub fn deinit(self: *Surface) void {
-        if (self.title) |v| self.app.core_app.alloc.free(v);
         self.app.core_app.deleteSurface(self);
         self.core_surface.deinit();
+        if (self.working_directory) |dir| self.app.core_app.alloc.free(dir);
+        if (self.title) |v| self.app.core_app.alloc.free(v);
         if (self.pixels.len > 0) self.app.core_app.alloc.free(self.pixels);
     }
 
